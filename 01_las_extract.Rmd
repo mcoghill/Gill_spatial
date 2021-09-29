@@ -1,0 +1,137 @@
+---
+title: "01_Extraction"
+author: "Matthew Coghill"
+date: "9/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The main objectives of this script will be to simply extract LAS files from the zipped folders and place them into a new folder for use later on. First, load required packages.
+
+```{r}
+
+ls <- c("tidyverse", "lidR", "xml2", "sf")
+new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
+if(length(new_packages)) 
+  install.packages(new_packages, Ncpus = cpus)
+
+invisible(suppressPackageStartupMessages(lapply(ls, library, character.only = TRUE)))
+
+```
+
+Next, we can find the .las files located in the zipped folders and extract those specifically. Before doing so though, we will make sure that there is a folder created for their export.
+
+```{r}
+
+# Define directories, create output folder
+raw_dir <- file.path("./01_raw")
+out_dir <- file.path("./02_las")
+dir.create(out_dir, showWarnings = FALSE)
+
+# Extract all files from the LAS folder - this will take a while.
+zip_files <- list.files(raw_dir, pattern = ".zip$", full.names = TRUE)
+las_files <- lapply(zip_files, function(x) {
+  y <- unzip(x, list = TRUE) %>% 
+    dplyr::filter(grepl(".las$", Name)) %>% 
+    dplyr::pull(Name) %>% 
+    dirname()
+  yy <- unzip(zip_files[1], list = TRUE) %>% 
+    dplyr::filter(grepl(y, Name)) %>% 
+    dplyr::pull(Name)
+  xd <- file.path(out_dir, basename(tools::file_path_sans_ext(yy[endsWith(yy, ".las")])))
+  dir.create(xd, showWarnings = FALSE)
+  unzip(x, yy, junkpaths = TRUE, exdir = xd)
+  list.files(xd, full.names = TRUE)
+}) 
+
+```
+
+The extracted LAS files are huge. Tiling helps to process things on normal computers a lot more quickly, so perform tiling for each extracted LAS file.
+
+```{r}
+
+las_all <- list.files(out_dir, pattern = ".las$", full.names = TRUE)
+tile_dir <- file.path("./03_las_tile")
+dir.create(tile_dir, showWarnings = FALSE)
+
+x <- las_all[1]
+ctg <- readLAScatalog(x)
+
+# Try snipping to 250m x 250m tiles
+opt_chunk_buffer(ctg) <- 25
+opt_chunk_size(ctg) <- 250
+opt_output_files(ctg) <- file.path(tile_dir, paste0(
+  basename(tools::file_path_sans_ext(las_all[1])), "_{XLEFT}_{YBOTTOM}"))
+
+newctg <- catalog_retile(ctg)
+newctg <- readLAScatalog(tile_dir)
+
+```
+
+Inspecting the new catalog shows that there is no CRS and the provided X, Y, and Z
+
+The data catalog doesn't show an attached CRS, rather it appears to show a polygon with arbitrary distances. I am guessing that this is distance from origin. CRS data is included in an XML file in the same folder as the LAS file. My idea is to extract the proper CRS, apply it to the surrounding polygon, and then apply that CRS to the LAS catalog and subsequent tiles.
+
+```{r}
+
+crs_xml_dir <- unzip(zip_files[1], list = TRUE) %>% 
+  dplyr::filter(grepl(".las$", Name)) %>% 
+  dplyr::pull(Name) %>% 
+  dirname()
+
+crs_xml <- unzip(zip_files[1], list = TRUE) %>% 
+  dplyr::filter(grepl(crs_xml_dir, Name)) %>% 
+  dplyr::filter(grepl(".xml$", Name)) %>% 
+  dplyr::pull(Name)
+  
+crs_file <- unzip(zip_files[1], crs_xml, junkpaths = TRUE, exdir = out_dir)
+
+crs_data <- as_list(read_xml(crs_file))
+
+# Data appears to have 4326 for EPSG. Coordinates are given for origin. Convert to BC Albers
+# Don't really know how to do this so I'll try a few things.
+
+origin <- crs_data$ModelMetadata$SRS[[1]]
+
+# Remove first 4 characters of string
+origin <- substr(origin, 5, nchar(origin))
+
+# Convert to numbers and reverse order
+origin <- rev(as.numeric(unlist(strsplit(origin, ","))))
+
+# Convert to point
+org_pt <- st_sfc(st_point(origin), crs = 4326)
+
+# Transform to BC Albers (note: should also check with UTM's)
+org_pt_bca <- st_transform(org_pt, 3005)
+org_pt_utm <- st_transform(org_pt, 26910)
+
+```
+
+After some reading last night, I found that the simplest way to do this is to add coordinates to the X/Y parameters. The coordinates must be in a projected format that uses meters (BC Albers or UTM).
+
+```{r}
+
+org_x <- st_coordinates(org_pt_bca)[, "X"]
+org_y <- st_coordinates(org_pt_bca)[, "Y"]
+org_z <- as.numeric(unlist(strsplit(crs_data[[1]]$SRSOrigin[[1]], ",")))[3]
+
+las <- readLAS(list.files(tile_dir, full.names = TRUE)[16])
+las2 <- las_rescale(las, 1, 1, 1)
+las2 <- las_reoffset(las2, xoffset = org_x, yoffset = org_y, zoffset = org_z)
+las2$X <- (las2$X * las2@header@PHB$`X scale factor`) + las2@header@PHB$`X offset`
+las2$Y <- (las2$Y * las2@header@PHB$`Y scale factor`) + las2@header@PHB$`Y offset`
+las2$Z <- (las2$Z * las2@header@PHB$`Z scale factor`) + las2@header@PHB$`Z offset`
+
+crs(las2) <- 3005
+
+bbox2 <- st_as_sfc(st_bbox(c(xmin = las2@bbox[1], xmax = las2@bbox[3], 
+                            ymin = las2@bbox[2], ymax = las2@bbox[4]), crs = st_crs(3005)))
+
+mapview::mapview(bbox)+bbox2
+
+```
+

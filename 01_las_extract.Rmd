@@ -13,7 +13,7 @@ The main objectives of this script will be to simply extract LAS files from the 
 
 ```{r}
 
-ls <- c("tidyverse", "lidR", "xml2", "sf")
+ls <- c("tidyverse", "lidR", "xml2", "sf", "future")
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) 
   install.packages(new_packages, Ncpus = cpus)
@@ -38,7 +38,7 @@ las_files <- lapply(zip_files, function(x) {
     dplyr::filter(grepl(".las$", Name)) %>% 
     dplyr::pull(Name) %>% 
     dirname()
-  yy <- unzip(zip_files[1], list = TRUE) %>% 
+  yy <- unzip(x, list = TRUE) %>% 
     dplyr::filter(grepl(y, Name)) %>% 
     dplyr::pull(Name)
   xd <- file.path(out_dir, basename(tools::file_path_sans_ext(yy[endsWith(yy, ".las")])))
@@ -53,46 +53,72 @@ The extracted LAS files are huge. Tiling helps to process things on normal compu
 
 ```{r}
 
-las_all <- list.files(out_dir, pattern = ".las$", full.names = TRUE)
+las_files <- list.files(out_dir, pattern = ".las$", full.names = TRUE, recursive = TRUE)
 tile_dir <- file.path("./03_las_tile")
 dir.create(tile_dir, showWarnings = FALSE)
 
-x <- las_all[1]
-ctg <- readLAScatalog(x)
+retile <- lapply(las_files[1], function(x) {
+  # x <- las_files[1]
+  ctg <- readLAScatalog(x)
+  tile_out <- file.path(tile_dir, basename(dirname(x)))
+  
+  # Try snipping to 250m x 250m tiles
+  opt_chunk_buffer(ctg) <- 25
+  opt_chunk_size(ctg) <- 250
+  opt_output_files(ctg) <- file.path(tile_out, paste0(basename(tile_out), 
+                                                      "_{XLEFT}_{YBOTTOM}"))
+  
+  newctg <- catalog_retile(ctg)
+  newctg <- readLAScatalog(tile_out)
+})
 
-# Try snipping to 250m x 250m tiles
-opt_chunk_buffer(ctg) <- 25
-opt_chunk_size(ctg) <- 250
-opt_output_files(ctg) <- file.path(tile_dir, paste0(
-  basename(tools::file_path_sans_ext(las_all[1])), "_{XLEFT}_{YBOTTOM}"))
-
-newctg <- catalog_retile(ctg)
-newctg <- readLAScatalog(tile_dir)
 
 ```
 
-Inspecting the new catalog shows that there is no CRS and the provided X, Y, and Z
-
-The data catalog doesn't show an attached CRS, rather it appears to show a polygon with arbitrary distances. I am guessing that this is distance from origin. CRS data is included in an XML file in the same folder as the LAS file. My idea is to extract the proper CRS, apply it to the surrounding polygon, and then apply that CRS to the LAS catalog and subsequent tiles.
+Now that the original files are tiled, we must deal with the fact that there is a lack of CRS applied to the X, Y, and Z coordinates. These details are located within the XML files that are extracted from the LAS folder. Then, I want to create a function that will iteratively go through each of the tiles and apply the CRS information to each of the points.
 
 ```{r}
 
-crs_xml_dir <- unzip(zip_files[1], list = TRUE) %>% 
-  dplyr::filter(grepl(".las$", Name)) %>% 
-  dplyr::pull(Name) %>% 
-  dirname()
+# Load the XML information
+xml_files <- list.files(out_dir, pattern = ".xml$", full.names = TRUE, recursive = TRUE)
 
-crs_xml <- unzip(zip_files[1], list = TRUE) %>% 
-  dplyr::filter(grepl(crs_xml_dir, Name)) %>% 
-  dplyr::filter(grepl(".xml$", Name)) %>% 
-  dplyr::pull(Name)
-  
-crs_file <- unzip(zip_files[1], crs_xml, junkpaths = TRUE, exdir = out_dir)
+# 1) Create generic function
+coord_fix <- function(las, ...) {
+  UseMethod("coord_fix", las)
+}
 
-crs_data <- as_list(read_xml(crs_file))
+# 2) Create method for las objects
+coord_fix.LAS <- function(las, xoffset, yoffset, zoffset, crs) {
+  las2 <- las_rescale(las, 0.001, 0.001, 0.001)
+  las2 <- las_reoffset(las2, xoffset, yoffset, zoffset)
+  las2$X <- las2$X + xoffset
+  las2$Y <- las2$Y + yoffset
+  las2$Z <- las2$Z + zoffset
+  crs(las2) <- crs
+  return(las2)
+}
 
-# Data appears to have 4326 for EPSG. Coordinates are given for origin. Convert to BC Albers
-# Don't really know how to do this so I'll try a few things.
+# 3) Create a method for LAScluster objects (chunk)
+coord_fix.LAScluster <- function(las, xoffset, yoffset, zoffset, crs) {
+  x <- readLAS(las)
+  if (is.empty(x)) return(NULL)
+  xx <- coord_fix(x, xoffset, yoffset, zoffset, crs)
+  return(xx)
+}
+
+# 4) Create a method for LAScatalog objects
+coord_fix.LAScatalog <- function(las, xoffset, yoffset, zoffset, crs) {
+  opt_select(las) <- "*"
+  options <- list(automerge = TRUE, need_output_file = TRUE)
+  output <- catalog_apply(las, coord_fix, xoffset = xoffset, yoffset = yoffset,
+                          zoffset = zoffset, crs = crs, .options = options)
+  return(output)
+}
+
+# start lapply loop here
+x <- xml_files[1]
+
+crs_data <- as_list(read_xml(x))
 
 origin <- crs_data$ModelMetadata$SRS[[1]]
 
@@ -107,31 +133,54 @@ org_pt <- st_sfc(st_point(origin), crs = 4326)
 
 # Transform to BC Albers (note: should also check with UTM's)
 org_pt_bca <- st_transform(org_pt, 3005)
-org_pt_utm <- st_transform(org_pt, 26910)
 
-```
-
-After some reading last night, I found that the simplest way to do this is to add coordinates to the X/Y parameters. The coordinates must be in a projected format that uses meters (BC Albers or UTM).
-
-```{r}
-
+# Get points of origin
 org_x <- st_coordinates(org_pt_bca)[, "X"]
 org_y <- st_coordinates(org_pt_bca)[, "Y"]
 org_z <- as.numeric(unlist(strsplit(crs_data[[1]]$SRSOrigin[[1]], ",")))[3]
 
-las <- readLAS(list.files(tile_dir, full.names = TRUE)[16])
-las2 <- las_rescale(las, 1, 1, 1)
-las2 <- las_reoffset(las2, xoffset = org_x, yoffset = org_y, zoffset = org_z)
-las2$X <- (las2$X * las2@header@PHB$`X scale factor`) + las2@header@PHB$`X offset`
-las2$Y <- (las2$Y * las2@header@PHB$`Y scale factor`) + las2@header@PHB$`Y offset`
-las2$Z <- (las2$Z * las2@header@PHB$`Z scale factor`) + las2@header@PHB$`Z offset`
-
-crs(las2) <- 3005
-
-bbox2 <- st_as_sfc(st_bbox(c(xmin = las2@bbox[1], xmax = las2@bbox[3], 
-                            ymin = las2@bbox[2], ymax = las2@bbox[4]), crs = st_crs(3005)))
-
-mapview::mapview(bbox)+bbox2
+# Run custom function
+ctg_in_dir <- file.path(tile_dir, basename(dirname(x)))
+ctg_out_dir <- file.path("./04_fixed_coords", basename(dirname(x)))
+dir.create(ctg_out_dir, showWarnings = FALSE, recursive = TRUE)
+ctg <- readLAScatalog(ctg_in_dir)
+opt_chunk_buffer(ctg) <- 0
+opt_output_files(ctg) <- file.path(ctg_out_dir, "{ORIGINALFILENAME}")
+newctg <- coord_fix(ctg, org_x, org_y, org_z, 3005)
 
 ```
+
+
+```{r}
+
+# Ground classification
+las <- readLAS(list.files(ctg_out_dir, full.names = TRUE)[5])
+las_grnd <- classify_ground(las, csf())
+las_norm <- normalize_height(las_grnd, tin())
+
+# Get CHM
+algo = pitfree(thresholds = c(0,10,20,30,40,50), subcircle = 0.2, max_edge = c(3, 1.5))
+chm  = grid_canopy(las, 0.5, algo)
+plot(chm, col = height.colors(50))
+
+# Smoothing
+ker = matrix(1,3,3)
+chm = focal(chm, w = ker, fun = median)
+chm = focal(chm, w = ker, fun = median)
+
+# Tree segmentation
+algo = watershed(chm, th = 4)
+las2 = segment_trees(las_norm, algo)
+
+# remove points that are not assigned to a tree
+trees = filter_poi(las2, !is.na(treeID))
+
+plot(trees, color = "treeID", colorPalette = pastel.colors(100))
+
+# Compute hulls
+hulls = st_as_sf(delineate_crowns(las2, func = .stdmetrics))
+
+```
+
+After some reading last night, I found that the simplest way to do this is to add coordinates to the X/Y parameters. The coordinates must be in a projected format that uses meters (BC Albers or UTM).
 

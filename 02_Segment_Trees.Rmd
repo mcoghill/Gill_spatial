@@ -1,0 +1,115 @@
+---
+title: "02_Segment_Trees"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+I have decided that dealing with tiles is dumb. Going to move on to try and process the large files by block.
+
+```{r}
+
+library(lidR)
+library(terra)
+set_lidr_threads(0)
+
+clip_dir <- file.path("./02_Clip")
+blocks <- list(
+  KM1209 = file.path(clip_dir, "KM1209.las"),
+  KM1210 = file.path(clip_dir, "KM1210.las"),
+  KM1212 = file.path(clip_dir, "KM1212.las"))
+
+```
+
+Here I will do some file cleaning
+
+```{r}
+
+clean_dir <- file.path("./03_clean")
+dir.create(clean_dir, showWarnings = FALSE)
+
+clean <- lapply(blocks, function(x) {
+  out <- file.path(clean_dir, basename(x))
+  las <- readLAS(x)
+  las <- las_reoffset(
+    las,
+    xoffset = mean(c(las@header@PHB[["Min X"]], las@header@PHB[["Max X"]])),
+    yoffset = mean(c(las@header@PHB[["Min Y"]], las@header@PHB[["Max Y"]])),
+    zoffset = mean(c(las@header@PHB[["Min Z"]], las@header@PHB[["Max Z"]])))
+  las <- classify_ground(las, csf())
+  las <- classify_noise(las, ivf())
+  las <- filter_poi(las, Classification != LASNOISE)
+  writeLAS(las, out)
+  return(out)
+})
+
+clean <- list(
+  KM1209 = file.path(clean_dir, "KM1209.las"),
+  KM1210 = file.path(clean_dir, "KM1210.las"),
+  KM1212 = file.path(clean_dir, "KM1212.las"))
+
+norm_dir <- file.path("./04_normalized")
+dir.create(norm_dir, showWarnings = FALSE)
+
+norm <- lapply(clean, function(x) {
+  out <- file.path(norm_dir, basename(x))
+  las <- readLAS(x)
+  las <- normalize_height(las, algorithm = tin(), Wdegenerated = FALSE)
+  writeLAS(las, out)
+  return(out)
+})
+
+```
+
+Now on to tree metrics
+
+```{r}
+
+# Load normalized tiles
+norm_dir <- file.path("./04_normalized")
+norm <- list(
+  KM1209 = file.path(norm_dir, "KM1209.las"),
+  KM1210 = file.path(norm_dir, "KM1210.las"),
+  KM1212 = file.path(norm_dir, "KM1212.las"))
+
+tree_las_dir_pre <- file.path("./05a_trees_las_pre")
+tree_las_dir_post <- file.path("./05b_trees_las_post")
+tree_shp_dir <- file.path("./05c_trees_shp")
+dir.create(tree_las_dir_pre, showWarnings = FALSE)
+dir.create(tree_las_dir_post, showWarnings = FALSE)
+dir.create(tree_shp_dir, showWarnings = FALSE)
+
+# Define minimum height of what a tree should be
+tree_thresh_tall <- 12
+w <- matrix(1, 3, 3)
+
+trees <- lapply(norm, function(x) {
+  x <- norm[[1]]
+  las <- readLAS(x, filter = "-drop_z_below 0 -drop_class 2")
+  zmax <- las@header@PHB[["Max Z"]]
+  
+  algo_chm <- pitfree(
+    thresholds = c(0, 2, seq(5, plyr::round_any(zmax, 5, ceiling), 5)),
+    max_edge = c(0, 1), subcircle = 0.15)
+  chm <- grid_canopy(las, 0.5, algo_chm)
+  chm <- raster(focal(rast(chm), w = w, fun = mean, na.rm = TRUE))
+  
+  opt_output_files(x) <- file.path(tree_las_dir_pre, "{*}")
+  
+  algo1 <- watershed(chm, th_tree = tree_thresh_tall)
+  # algo2 <- li2012(R = 0, hmin = tree_thresh_tall)
+  tree <- segment_trees(x, algorithm = algo1)
+  
+  tree_shp <- st_as_sf(tree_metrics(tree, func = .stdtreemetrics)) %>% 
+    dplyr::mutate(radius = sqrt(convhull_area/pi))
+  tree_shp <- st_as_sf(delineate_crowns(tree, type = "bbox", func = .stdtreemetrics))
+  
+  plan(sequential)
+  lidR:::catalog_laxindex(tree)
+  return(tree)
+}) %>% setNames(names(norm))
+
+```
+

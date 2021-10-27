@@ -13,7 +13,7 @@ The main objectives of this script will be to simply extract LAS files from the 
 
 ```{r}
 
-ls <- c("tidyverse", "lidR", "xml2", "sf", "future")
+ls <- c("tidyverse", "lidR", "xml2", "sf", "sfheaders", "future", "terra")
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) 
   install.packages(new_packages, Ncpus = cpus)
@@ -22,30 +22,57 @@ invisible(suppressPackageStartupMessages(lapply(ls, library, character.only = TR
 
 ```
 
+Shapes of the Goudie forest strips and project site boundaries are included in a geopackage. This can be loaded in and viewed with the `sf` package
+
+```{r}
+
+# Load Goudie shapes
+shape_dir <- file.path("./00_Shapes")
+goudie <- st_read(file.path(shape_dir, "Goudie.gpkg"), quiet = TRUE)
+bound <- dplyr::filter(goudie, Treatment == "Boundary") %>% 
+  dplyr::select(Block)
+
+# One of the shapes has a hole in it. Remove hole before continuing
+bound <- sf_remove_holes(bound)
+
+# Set up machine core usage - favor future package core use over lidr
+if(sqrt(availableCores()) %% 1 == 0) {
+  future_cores <- as.integer(sqrt(availableCores()))
+  lidr_cores <- as.integer(sqrt(availableCores()))
+} else if(availableCores() > 1L) {
+  divs <- sapply((availableCores() - 1):2, function(x) {
+    ifelse(availableCores() %% x == 0, x, NA)
+  })
+  divs <- divs[!is.na(divs)]
+  future_cores <- as.integer(divs[length(divs)/2])
+  lidr_cores <- as.integer(availableCores()/future_cores)
+}
+
+```
+
+The generated shapes will inform how much data is loaded into R for filtering areas away that we don't necessarily need.
+
 Next, we can find the .las files located in the zipped folders and extract those specifically. Before doing so though, we will make sure that there is a folder created for their export.
 
 ```{r}
 
 # Define directories, create output folder
-raw_dir <- file.path("./01_raw")
-out_dir <- file.path("./02_las")
-dir.create(out_dir, showWarnings = FALSE)
+zip_file <- file.path("E:", "L1 LiDAR", "Gaudie", "2_LAS", "Gaudie BC Albers.zip")
+unz_dir <- file.path("./01_las")
+dir.create(unz_dir, showWarnings = FALSE)
 
-# Extract all files from the LAS folder - this will take a while.
-zip_files <- list.files(raw_dir, pattern = ".zip$", full.names = TRUE)
-las_files <- lapply(zip_files, function(x) {
-  y <- unzip(x, list = TRUE) %>% 
-    dplyr::filter(grepl(".las$", Name)) %>% 
-    dplyr::pull(Name) %>% 
-    dirname()
-  yy <- unzip(x, list = TRUE) %>% 
-    dplyr::filter(grepl(y, Name)) %>% 
-    dplyr::pull(Name)
-  xd <- file.path(out_dir, basename(tools::file_path_sans_ext(yy[endsWith(yy, ".las")])))
-  dir.create(xd, showWarnings = FALSE)
-  unzip(x, yy, junkpaths = TRUE, exdir = xd)
-  list.files(xd, full.names = TRUE)
-}) 
+# List files in the .zip file and filter the list to only include LAS files
+las_files <- unzip(zip_file, list = TRUE) %>% 
+  dplyr::filter(grepl(".las$", Name)) %>% 
+  dplyr::pull(Name)
+
+# If those LAS files have already been extracted don't worry about it.
+las_files <- las_files[!file.exists(file.path(unz_dir, basename(las_files)))]
+if(length(las_files) > 0) {
+  # Unzip all LAS files - this will take a little while
+  las_files <- unzip(zip_file, las_files, junkpaths = TRUE, exdir = unz_dir)
+}
+
 
 ```
 
@@ -53,134 +80,432 @@ The extracted LAS files are huge. Tiling helps to process things on normal compu
 
 ```{r}
 
-las_files <- list.files(out_dir, pattern = ".las$", full.names = TRUE, recursive = TRUE)
-tile_dir <- file.path("./03_las_tile")
+unz_dir <- file.path("./01_las")
+las_files <- list.files(unz_dir, pattern = ".las$", full.names = TRUE)
+clip_dir <- file.path("./02_clip")
+tile_dir <- file.path("./03_tile")
+dir.create(clip_dir, showWarnings = FALSE)
 dir.create(tile_dir, showWarnings = FALSE)
 
-retile <- lapply(las_files[1], function(x) {
-  # x <- las_files[1]
-  ctg <- readLAScatalog(x)
-  tile_out <- file.path(tile_dir, basename(dirname(x)))
-  
-  # Try snipping to 250m x 250m tiles
-  opt_chunk_buffer(ctg) <- 25
-  opt_chunk_size(ctg) <- 250
-  opt_output_files(ctg) <- file.path(tile_out, paste0(basename(tile_out), 
-                                                      "_{XLEFT}_{YBOTTOM}"))
-  
-  newctg <- catalog_retile(ctg)
-  newctg <- readLAScatalog(tile_out)
-})
+# Want to separate folders for where the tiled LAS files get extracted to, so
+# figure out which two tiles are for block 1210
+all_las <- readLAScatalog(las_files)
+mapview::mapview(all_las)+bound
 
+# Blocks 2 and 4 belong to block 1210, 1 = block 1212, 3 = block 1209
+blocks <- list(
+  KM1209 = readLAScatalog(las_files[3]),
+  KM1210 = readLAScatalog(las_files[c(2, 4)]),
+  KM1212 = readLAScatalog(las_files[1])
+)
+
+# Perform tiling. Create separate folders for each block to place tiles into
+# and adjust some lidR specific variables
+retile <- lapply(names(blocks), function(x) {
+  # x <- names(blocks)[1]
+  
+  # 1) Clip full block to AOI
+  plan(sequential)
+  set_lidr_threads(0)
+  block <- blocks[[x]]
+  epsg <- st_crs(crs(block))$epsg
+  opt_output_files(block) <- file.path(clip_dir, x)
+  aoi <- dplyr::filter(bound, Block == x) %>% 
+    st_transform(epsg)
+  block_clip <- clip_roi(block, aoi)
+  
+  # 2) Retile catalog from clipped block
+  plan(multisession)
+  set_lidr_threads(1)
+  block_dir <- file.path(tile_dir, x)
+  dir.create(block_dir, showWarnings = FALSE)
+  
+  # Catalog processing options
+  opt_chunk_buffer(block_clip) <- 0
+  opt_chunk_size(block_clip) <- 250
+  opt_chunk_alignment(block_clip) <- c(
+    plyr::round_any(xmin(block_clip), 10, floor),
+    plyr::round_any(ymin(block_clip), 10, floor))
+  opt_output_files(block_clip) <- file.path(block_dir, paste0(x, "_{XLEFT}_{YBOTTOM}"))
+  ctg <- catalog_retile(block_clip)
+  ctg <- readLAScatalog(block_dir)
+  plan(sequential)
+  lidR:::catalog_laxindex(ctg)
+  return(ctg)
+}) %>% setNames(names(blocks))
 
 ```
 
-Now that the original files are tiled, we must deal with the fact that there is a lack of CRS applied to the X, Y, and Z coordinates. These details are located within the XML files that are extracted from the LAS folder. Then, I want to create a function that will iteratively go through each of the tiles and apply the CRS information to each of the points.
+Okay great! Everything is tiled up. We still need to work on the catalog to produce the following sets of tiles:
 
-```{r}
+1. Tiles with true heights
+2. Tiles with normalized heights for tree segmentation
 
-# Load the XML information
-xml_files <- list.files(out_dir, pattern = ".xml$", full.names = TRUE, recursive = TRUE)
-
-# 1) Create generic function
-coord_fix <- function(las, ...) {
-  UseMethod("coord_fix", las)
-}
-
-# 2) Create method for las objects
-coord_fix.LAS <- function(las, xoffset, yoffset, zoffset, crs) {
-  las2 <- las_rescale(las, 0.001, 0.001, 0.001)
-  las2 <- las_reoffset(las2, xoffset, yoffset, zoffset)
-  las2$X <- las2$X + xoffset
-  las2$Y <- las2$Y + yoffset
-  las2$Z <- las2$Z + zoffset
-  crs(las2) <- crs
-  return(las2)
-}
-
-# 3) Create a method for LAScluster objects (chunk)
-coord_fix.LAScluster <- function(las, xoffset, yoffset, zoffset, crs) {
-  x <- readLAS(las)
-  if (is.empty(x)) return(NULL)
-  xx <- coord_fix(x, xoffset, yoffset, zoffset, crs)
-  return(xx)
-}
-
-# 4) Create a method for LAScatalog objects
-coord_fix.LAScatalog <- function(las, xoffset, yoffset, zoffset, crs) {
-  opt_select(las) <- "*"
-  options <- list(automerge = TRUE, need_output_file = TRUE)
-  output <- catalog_apply(las, coord_fix, xoffset = xoffset, yoffset = yoffset,
-                          zoffset = zoffset, crs = crs, .options = options)
-  return(output)
-}
-
-# start lapply loop here
-x <- xml_files[1]
-
-crs_data <- as_list(read_xml(x))
-
-origin <- crs_data$ModelMetadata$SRS[[1]]
-
-# Remove first 4 characters of string
-origin <- substr(origin, 5, nchar(origin))
-
-# Convert to numbers and reverse order
-origin <- rev(as.numeric(unlist(strsplit(origin, ","))))
-
-# Convert to point
-org_pt <- st_sfc(st_point(origin), crs = 4326)
-
-# Transform to BC Albers (note: should also check with UTM's)
-org_pt_bca <- st_transform(org_pt, 3005)
-
-# Get points of origin
-org_x <- st_coordinates(org_pt_bca)[, "X"]
-org_y <- st_coordinates(org_pt_bca)[, "Y"]
-org_z <- as.numeric(unlist(strsplit(crs_data[[1]]$SRSOrigin[[1]], ",")))[3]
-
-# Run custom function
-ctg_in_dir <- file.path(tile_dir, basename(dirname(x)))
-ctg_out_dir <- file.path("./04_fixed_coords", basename(dirname(x)))
-dir.create(ctg_out_dir, showWarnings = FALSE, recursive = TRUE)
-ctg <- readLAScatalog(ctg_in_dir)
-opt_chunk_buffer(ctg) <- 0
-opt_output_files(ctg) <- file.path(ctg_out_dir, "{ORIGINALFILENAME}")
-newctg <- coord_fix(ctg, org_x, org_y, org_z, 3005)
-
-```
+Before that happens, we will work on "cleaning" the files up a little bit. First, re-offsetting the coordinates for each tile is necessary for tree ground classification will occur. Next, noise classification and subsequent filtering of the noisy points.
 
 
 ```{r}
+
+tile_dir <- file.path("./03_tile")
+retile <- lapply(dir(tile_dir, full.names = TRUE), readLAScatalog) %>% 
+  setNames(dir(tile_dir))
+
+# Create function to run over each tile
+clnfun <- function(las) {
+  las <- readLAS(las)
+  if (is.empty(las)) return(NULL)
+  
+  # las <- las_reoffset(
+  #   las,
+  #   xoffset = mean(c(las@header@PHB[["Min X"]], las@header@PHB[["Max X"]])),
+  #   yoffset = mean(c(las@header@PHB[["Min Y"]], las@header@PHB[["Max Y"]])),
+  #   zoffset = mean(c(las@header@PHB[["Min Z"]], las@header@PHB[["Max Z"]])))
+  las <- classify_ground(las, csf())
+  las <- classify_noise(las, ivf())
+  las <- filter_poi(las, Classification != LASNOISE)
+  las <- filter_poi(las, buffer == 0)
+  return(las)
+}
 
 # Ground classification
-las <- readLAS(list.files(ctg_out_dir, full.names = TRUE)[5])
-las_grnd <- classify_ground(las, csf())
-las_norm <- normalize_height(las_grnd, tin())
+clean_dir <- file.path("./04a_cleaned")
+dir.create(clean_dir, showWarnings = FALSE)
 
-# Get CHM
-algo = pitfree(thresholds = c(0,10,20,30,40,50), subcircle = 0.2, max_edge = c(3, 1.5))
-chm  = grid_canopy(las, 0.5, algo)
-plot(chm, col = height.colors(50))
+set_lidr_threads(1)
+clean <- lapply(names(retile), function(x) {
+  # x <- names(retile)[1]
+  block <- retile[[x]]
+  plan(multisession(workers = min(availableCores(), length(block))))
+  
+  clean_tile_dir <- file.path(clean_dir, x)
+  dir.create(clean_tile_dir, showWarnings = FALSE)
+  
+  opt_output_files(block) <- file.path(clean_tile_dir, "{*}")
+  opt_chunk_buffer(block) <- 12.5
+  
+  clean_out <- catalog_apply(block, clnfun, .options = list(automerge = TRUE))
+  lidR:::catalog_laxindex(clean_out)
+  plan(sequential)
+  return(clean_out)
+}) %>% setNames(names(retile))
 
-# Smoothing
-ker = matrix(1,3,3)
-chm = focal(chm, w = ker, fun = median)
-chm = focal(chm, w = ker, fun = median)
+# Normalize heights
+clean_dir <- file.path("./04a_cleaned")
+clean <- lapply(dir(clean_dir, full.names = TRUE), readLAScatalog) %>% 
+  setNames(dir(clean_dir))
 
-# Tree segmentation
-algo = watershed(chm, th = 4)
-las2 = segment_trees(las_norm, algo)
+norm_dir <- file.path("./05a_normalized")
+dir.create(norm_dir, showWarnings = FALSE)
 
-# remove points that are not assigned to a tree
-trees = filter_poi(las2, !is.na(treeID))
-
-plot(trees, color = "treeID", colorPalette = pastel.colors(100))
-
-# Compute hulls
-hulls = st_as_sf(delineate_crowns(las2, func = .stdmetrics))
+norm <- lapply(names(clean), function(x) {
+  block <- clean[[x]]
+  
+  # Set up parallel environment - chunk based is faster, but need to work with
+  # the number of machine cores to optimize numbers
+  set_lidr_threads(lidr_cores)
+  plan(multisession, workers = future_cores)
+  
+  norm_out <- file.path(norm_dir, x)
+  dir.create(norm_out, showWarnings = FALSE)
+  
+  opt_output_files(block) <- file.path(norm_out, "{*}")
+  opt_chunk_buffer(block) <- 12.5
+  norm_ctg <- normalize_height(block, algorithm = tin(), 
+                               add_lasattribute = TRUE, Wdegenerated = FALSE)
+  lidR:::catalog_laxindex(norm_ctg)
+  plan(sequential)
+  return(norm_ctg)
+}) %>% setNames(names(clean))
 
 ```
 
-After some reading last night, I found that the simplest way to do this is to add coordinates to the X/Y parameters. The coordinates must be in a projected format that uses meters (BC Albers or UTM).
+We now have a good set of tiles for deriving terrain metrics (DEM which can be used to derive many other layers), as well as normalized tiles for deriving tree metrics with. For now, let's continue working with the point cloud to estimate tree metrics. The li2012 algorithm is slow but the most accurate for use to segment trees within the point cloud; however, in order to speed things up a little bit we will use the watershed algorithm to first estimate the maximum size of tree crowns.
 
+The flow will be something like this:
+
+1. Create CHM for watershed algorithm
+2. Run watershed algorithm (fast)
+3. Round up the max crown radius to inform the li2012 algorithm for speeding it up
+
+```{r}
+
+# Load normalized tiles
+norm_dir <- file.path("./05a_normalized")
+norm <- lapply(dir(norm_dir, full.names = TRUE), readLAScatalog) %>% 
+  setNames(dir(norm_dir))
+
+clean_trees_dir <- file.path("./04b_cleaned_trees")
+norm_trees_dir <- file.path("./05b_normalized_trees")
+tree_shp_dir <- file.path("./06_trees_shp")
+dir.create(clean_trees_dir, showWarnings = FALSE)
+dir.create(norm_trees_dir, showWarnings = FALSE)
+dir.create(tree_shp_dir, showWarnings = FALSE)
+
+# Define minimum height of what a tree should be
+tree_thresh_tall <- 12
+w <- matrix(1, 3, 3)
+
+trees <- lapply(names(norm), function(x) {
+  # x <- names(norm)[3]
+  block <- norm[[x]]
+  zmax <- max(block$Max.Z)
+  tree_las_out <- file.path(norm_trees_dir, x)
+  tree_las_unnorm_out <- file.path(clean_trees_dir, x)
+  dir.create(tree_las_out, showWarnings = FALSE)
+  dir.create(tree_las_unnorm_out, showWarnings = FALSE)
+  
+  # pitfree algorithm is parallelised, so combine normal parallelisation and 
+  # chunk based
+  plan(multisession, workers = future_cores)
+  set_lidr_threads(lidr_cores)
+  
+  # Generate CHM in memory
+  opt_output_files(block) <- ""
+  opt_chunk_buffer(block) <- 12.5
+  
+  algo_chm <- pitfree(
+    thresholds = c(0, 2, seq(5, plyr::round_any(zmax, 5, ceiling), 5)),
+    max_edge = c(0, 1), subcircle = 0.15)
+  chm <- grid_canopy(block, 0.5, algo_chm)
+  chm <- raster(focal(rast(chm), w = w, fun = mean, na.rm = TRUE))
+  
+  # Generate LAS files that have segmented trees from the watershed algorithm
+  # For faster computation, ignore the ground classified points
+  opt_output_files(block) <- file.path(tempdir(), "{*}_trees")
+  opt_filter(block) <- "-drop_z_below 0 -drop_class 2"
+  
+  # Watershed is not parallelised, so use chunk based parallelisation only
+  algo1 <- watershed(chm, th_tree = tree_thresh_tall)
+  plan(multisession, workers = min(availableCores(), length(block)))
+  set_lidr_threads(1L)
+  tree <- segment_trees(block, algorithm = algo1, uniqueness = "bitmerge")
+  
+  # Now merge segmented trees with ground classified points
+  opt_filter(block) <- "-drop_z_below 0 -keep_class 2"
+  opt_output_files(block) <- file.path(tempdir(), "{*}_ground")
+  block_grnd <- catalog_retile(block)
+  tree_full <- rbind(block_grnd, tree)
+  
+  # Use catalog_retile to perform merge. Set processing options for the merge,
+  # and save tiles as temporary files
+  opt_chunk_size(tree_full) <- 250
+  opt_chunk_buffer(tree_full) <- 0
+  opt_filter(tree_full) <- "-drop_z_below 0"
+  opt_chunk_alignment(tree_full) <- c(
+    plyr::round_any(xmin(tree_full), 10, floor),
+    plyr::round_any(ymin(tree_full), 10, floor))
+  opt_output_files(tree_full) <- file.path(tempdir(), paste0(x, "_{XLEFT}_{YBOTTOM}_merge"))
+  
+  tree_recombine <- catalog_retile(tree_full)
+  tree_recombine <- readLAScatalog(
+    list.files(tempdir(), pattern = paste0(x, "_*.*_merge.las$"), full.names = TRUE))
+  lidR:::catalog_laxindex(tree_recombine)
+  
+  # Generate shapes of the crowns to get shape area and radius
+  opt_output_files(tree) <- ""
+  opt_chunk_buffer(tree) <- 12.5
+  opt_filter(tree) <- "-drop_z_below 0"
+  plan(multisession, workers = min(availableCores(), length(block)))
+  tree_shp <- st_as_sf(delineate_crowns(tree, type = "concave", concavity = 1, func = .stdtreemetrics)) %>% 
+    dplyr::mutate(area = st_area(.), radius = sqrt(area/pi))
+  
+  # Use the 95th percentile of tree radii rounded up to the nearest 0.25 as the 
+  # radius to be used in li2012(speed_up)
+  tree_radius <- plyr::round_any(
+    as.numeric(quantile(tree_shp$radius, prob = 0.95)), 0.25, ceiling)
+  
+  ### li2012 processing
+  # Once again start from the normalized tiles. Generate temporary files and 
+  # filter out the ground points on load for faster computation
+  opt_output_files(block) <- file.path(tempdir(), "{*}_trees")
+  opt_filter(block) <- "-drop_z_below 0 -drop_class 2"
+  
+  # li2012 is not parallelised, so use chunk based parallelism only
+  algo2 <- li2012(R = 0, hmin = tree_thresh_tall, speed_up = min(tree_radius, 5))
+  plan(multisession, workers = min(availableCores(), length(block)))
+  tree <- segment_trees(block, algorithm = algo2, uniqueness = "bitmerge")
+  
+  # Now merge segmented trees with ground classified points
+  opt_filter(block) <- "-drop_z_below 0 -keep_class 2"
+  opt_output_files(block) <- file.path(tempdir(), "{*}_ground")
+  block_grnd <- catalog_retile(block)
+  tree_full <- rbind(block_grnd, tree)
+  
+  # Use catalog_retile to perform merge. Set processing options for the merge,
+  # and save tiles to output folder
+  opt_chunk_size(tree_full) <- 250
+  opt_chunk_buffer(tree_full) <- 0
+  opt_filter(tree_full) <- "-drop_z_below 0"
+  opt_chunk_alignment(tree_full) <- c(
+    plyr::round_any(xmin(tree_full), 10, floor),
+    plyr::round_any(ymin(tree_full), 10, floor))
+  opt_output_files(tree_full) <- file.path(tree_las_out, paste0(x, "_{XLEFT}_{YBOTTOM}"))
+  
+  tree_recombine <- catalog_retile(tree_full)
+  tree_recombine <- readLAScatalog(file.path(tree_las_out))
+  lidR:::catalog_laxindex(tree_recombine)
+  
+  # Unnormalize heights - doesn't work with catalogs
+  plan(sequential)
+  set_lidr_threads(0)
+  tree_unnorm <- readLAScatalog(sapply(tree_recombine$filename, function(y) {
+    out <- file.path(tree_las_unnorm_out, basename(y))
+    las <- readLAS(y)
+    las <- unnormalize_height(las)
+    
+    # Need to remove Extra_Bytes from header
+    las@header@VLR <- las@header@VLR[-which(names(las@header@VLR) == "Extra_Bytes")]
+    writeLAS(las, out, index = TRUE)
+    return(out)
+  }))
+  
+  # Generate shapes of the crowns to get shape area and radius
+  opt_output_files(tree) <- ""
+  opt_chunk_buffer(tree) <- 12.5
+  opt_filter(tree) <- "-drop_z_below 0"
+  plan(multisession, workers = min(availableCores(), length(block)))
+  set_lidr_threads(1)
+  # tree_shp <- st_as_sf(delineate_crowns(tree, type = "concave", concavity = 1, func = .stdtreemetrics)) %>% 
+  tree_shp <- st_as_sf(delineate_crowns(
+    tree, type = "concave", concavity = 1, 
+    func = ~c(if(length(X) > 3) {
+      c(stdtreemetrics(X, Y, Z),
+        volume = geometry::convhulln(matrix(c(X, Y, Z), ncol = 3), options = "FA")[["vol"]])
+    } else NULL))) %>% 
+    dplyr::mutate(block = x, area = st_area(.), radius = sqrt(area/pi))
+  
+  plan(sequential)
+  
+  # Clean temporary files
+  f <- list.files(tempdir(), pattern = ".las$", full.names = TRUE)
+  file.remove(f)
+  return(tree_shp)
+}) %>% setNames(names(norm))
+
+# Write full shape
+tree_full <- st_sf(data.table::rbindlist(trees))
+st_write(tree_full, file.path(tree_shp_dir, "tree_polys.gpkg"), quiet = TRUE, delete_layer = TRUE)
+
+# Write bounding boxes of each shape for ease
+tree_bbox <- st_sf(data.table::rbindlist(lapply(1:nrow(tree_full), function(x) {
+  xx <- tree_full[x, ]
+  st_geometry(xx) <- st_as_sfc(st_bbox(st_geometry(xx)))
+  return(xx)
+})))
+st_write(tree_bbox, file.path(tree_shp_dir, "tree_bbox.gpkg"), quiet = TRUE, delete_layer = TRUE)
+
+```
+
+Success! Trees have been properly segmented from the point cloud, and shapes of the canopies have been exported. It took about 2.5 hours and resulted in approximately 47,000 trees total.
+
+Now, let's look at these trees and the strips to identify edge trees and reserve trees. For this, we want to figure out things like which trees are the ones along the strip edges and which are fully within the reserves. While having the exact shape of the trees from above is important, using bounding boxes will be more suited for processing since it will be faster.
+
+```{r}
+
+tree_shp_dir <- file.path("./06_trees_shp")
+tree_bbox <- st_read(file.path(tree_shp_dir, "tree_bbox.gpkg"), quiet = TRUE)
+tree_full <- st_read(file.path(tree_shp_dir, "tree_polys.gpkg"), quiet = TRUE)
+
+goudie <- st_transform(goudie, st_crs(tree_bbox))
+strip_edges <- st_read(file.path(shape_dir, "Goudie_Strip_Edges.gpkg"), quiet = TRUE) %>% 
+  st_transform(st_crs(tree_full))
+
+strips <- dplyr::filter(goudie, startsWith(Treatment, "Treatment"))
+reserves <- dplyr::filter(goudie, startsWith(Treatment, "Reserve"))
+controls <- dplyr::filter(goudie, startsWith(Treatment, "C"))
+blocks <- dplyr::filter(goudie, startsWith(Treatment, "B")) %>% 
+  sf_remove_holes()
+
+block_flt <- st_difference(blocks, st_union(rbind(strips, reserves, controls)))
+
+# ID Edge trees by finding the closest trees to the edges of the strip shapes
+# First, convert strip polygons to series of points
+strip_sample <- st_cast(strip_edges, "LINESTRING", warn = FALSE) %>% 
+  st_line_sample(density = 1) %>% 
+  st_cast("POINT") %>%
+  st_as_sf() %>% 
+  st_intersection(st_set_agr(st_buffer(strip_edges, 2.5), "constant"))
+
+# Filter tree_bbox to only include unique trees that are nearest to each point,
+# and perform spatial join to capture data to identify the strips that those trees
+# are a part of
+edge_trees <- tree_full[unique(st_nearest_feature(strip_sample, tree_full)), ]
+edge_join <- st_join(edge_trees, strips, join = st_nearest_feature) %>% 
+  dplyr::filter(block == Block) %>% 
+  dplyr::mutate(Treatment = paste0(Treatment, "_edge"))
+edge_join_aspect <- st_join(edge_trees, strip_edges, join = st_nearest_feature) %>% 
+  dplyr::filter(block == Block) %>% 
+  dplyr::select(treeID, Treatment, block, StripID, Aspect, Z, npoints, radius, area, volume)
+
+# Remove identified edge trees. Now, identify trees fully within the reserves
+trees_remain <- dplyr::filter(tree_full, !treeID %in% edge_join$treeID)
+reserve_trees <- trees_remain[unlist(st_intersects(reserves, trees_remain)), ]
+reserve_join <- st_join(reserve_trees, reserves)
+
+# Remove identified reserve trees. Now, identify trees in the control blocks
+trees_remain <- dplyr::filter(trees_remain, !treeID %in% reserve_join$treeID)
+control_trees <- trees_remain[unlist(st_intersects(controls, trees_remain)), ]
+control_join <- st_join(control_trees, controls)
+
+# Remove identified control trees. Now, identify remaining trees
+trees_remain <- dplyr::filter(trees_remain, !treeID %in% control_join$treeID)
+extra_trees <- trees_remain[unlist(st_intersects(block_flt, trees_remain)), ]
+extra_join <- st_join(extra_trees, block_flt)
+
+# Remove trees outside of controls, strips, and reserves. Now, identify trees fully within the strips
+trees_remain <- dplyr::filter(trees_remain, !treeID %in% extra_join$treeID)
+strip_trees <- trees_remain[unlist(st_intersects(strips, trees_remain)), ]
+strip_join <- st_join(strip_trees, strips)
+
+# Merge everything back together and summarize that data
+tree_shp_merge <- rbind(edge_join, reserve_join, control_join, extra_join, strip_join) %>% 
+  dplyr::select(treeID, Treatment, block, ID, Strip_Orientation, Z, npoints, radius, area, volume)
+
+tree_shp_data <- st_drop_geometry(tree_shp_merge) %>% 
+  group_by(block, Treatment) %>% 
+  summarise(mean_area = mean(area), mean_height = mean(Z), mean_volume = mean(volume),
+            n = n(), min_height = min(Z), max_height = max(Z), .groups = "drop")
+
+edge_tree_data <- st_drop_geometry(edge_join_aspect) %>% 
+  group_by(Treatment, Aspect) %>% 
+  summarise(mean_area = mean(area), mean_height = mean(Z), mean_volume = mean(volume),
+            n = n(), min_height = min(Z), max_height = max(Z), .groups = "drop")
+
+# Calculate stem density. First, remove edge trees. Then, group variables and
+# summarise the data to get the number of trees in each strip/reserve/control
+# area. Join it back with the shapes of Goudie which contain info on the spatial
+# area. Change any missing NA values to 0's since they represent 0 stems/ha
+stem_density <- st_drop_geometry(tree_shp_merge) %>% 
+  dplyr::filter(!endsWith(Treatment, "_edge")) %>% 
+  group_by(block, Treatment, ID, Strip_Orientation) %>% 
+  summarise(n = n(), .groups = "drop") %>% 
+  full_join(goudie, by = c("block" = "Block", "Treatment", "ID", "Strip_Orientation")) %>% 
+  st_sf() %>% 
+  dplyr::mutate(
+    n = ifelse(is.na(n), 0, n),
+    area = units::set_units(st_area(.), "ha"), density = n / area)
+
+# Summarise density data by treatment and orientation
+stem_density_sum <- st_drop_geometry(stem_density) %>% 
+  group_by(Treatment, Strip_Orientation) %>% 
+  summarise(mean_density = mean(density), .groups = "drop")
+
+```
+
+The next steps will involve performing the same analysis on smaller trees, where I would use `filter_poi()` to select points without a treeID field, and performing the same steps to get data on the shorter trees. Remaining points would be assigned as shrubbery and grasses, and similar volume measurements can be made throughout. Until I hear that this is something of interest, I will retire my efforts.
+
+I'll also do some digging into the data of the edge trees below.
+
+```{r}
+
+df <- st_drop_geometry(edge_join_aspect) %>% 
+  dplyr::select(Treatment, Aspect, Z, volume)
+height_analysis <- aov(Z ~ Treatment * Aspect, data = df)
+summary(height_analysis)
+height_tukey <- TukeyHSD(height_analysis)
+
+volume_analysis <- aov(volume ~ Treatment * Aspect, data = df)
+summary(volume_analysis)
+volume_tukey <- TukeyHSD(volume_analysis)
+
+```

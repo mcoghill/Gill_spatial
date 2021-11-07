@@ -39,11 +39,6 @@ vignettes/*.pdf
 .Renviron
 
 # Other files defined by user (data etc.)
-01_las
-02_clip
-03_tile
-04a_cleaned
-04b_cleaned_trees
-05a_normalized
-05b_normalized_trees
-06_trees_shp
+*.las
+*.lax
+/06_trees_shp/*

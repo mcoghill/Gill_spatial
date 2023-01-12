@@ -41,4 +41,10 @@ vignettes/*.pdf
 # Other files defined by user (data etc.)
 *.las
 *.lax
-/06_trees_shp/*
+/01_las/*
+/02_tile/*
+/03_clean_norm/*
+/04_clean_norm_tree/*
+/05_clean_tree/*
+/06_tree_shp/*
+/07_results/*

@@ -41,10 +41,13 @@ vignettes/*.pdf
 # Other files defined by user (data etc.)
 *.las
 *.lax
+/00_QGIS/*
+/00_Shapes/trees*
 /01_las/*
 /02_tile/*
 /03_clean_norm/*
-/04_clean_norm_tree/*
-/05_clean_tree/*
-/06_tree_shp/*
-/07_results/*
+/04_tree_seg/*
+/05_terrain/*
+/06_LAI_LAS/*
+/07_tree_data/*
+

@@ -28,7 +28,7 @@ Next, we can load the data for the tree heights and the shapes that were created
 
 # Read and manipulate field data spreadsheet. Blocks not assigned in spreadsheet,
 # but can backtrack through the data to determine which blocks are which.
-field_data <- read_excel("00_field_data/2022 Tree Measurements- clean.xlsx") |> 
+field_data <- read_excel("00_input_data/2022 Tree Measurements- clean.xlsx") |> 
   mutate(
     width = factor(as.numeric(substr(Trt, 1, 2))),
     orientation = factor(case_when(
@@ -53,11 +53,11 @@ field_data <- read_excel("00_field_data/2022 Tree Measurements- clean.xlsx") |>
   filter(height >= 10)
 
 # Read in the tree shapes
-trees <- st_read("00_Shapes/trees_attributed.gpkg", quiet = TRUE) |> 
+trees <- st_read("00_input_data/trees_attributed.gpkg", quiet = TRUE) |> 
   rename(height = Z) |> 
   mutate(across(c(width, aspect, orientation, block), factor))
 
-goudie <- st_read("00_Shapes/Goudie.gpkg", quiet = TRUE)
+goudie <- st_read("00_input_data/Goudie.gpkg", quiet = TRUE)
 ```
 
 Now that we have all of the data needed, we can build the models for tree heights. There are four total models: one for just the edge trees (strip width and aspect are taken into account here); one for the reserve trees (strip width and orientation are taken into account here), control trees (just the orientation of the block is taken into account), and any remaining trees (blocking used as a random effect). The DBH's are predicted and added to the dataframe, and then all dataframes are bound back together.
@@ -120,7 +120,7 @@ trees_vol <- cbind(
   relocate(attr(trees_dbh, "sf_column"), .after = last_col())
 
 # Write to a GeoPackage file
-st_write(trees_vol, "00_Shapes/trees_measured.gpkg", append = FALSE, 
+st_write(trees_vol, "00_input_data/trees_measured.gpkg", append = FALSE, 
          quiet = TRUE)
 ```
 

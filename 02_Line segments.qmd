@@ -16,7 +16,7 @@ First, load the required packages and define where the line segments are located
 ```{r}
 library(tidyverse)
 library(sf)
-seg_dir <- file.path("00_Shapes/Line Segments/")
+seg_dir <- file.path("00_input_data/Line Segments/")
 ```
 
 Now, it's all just data wrangling, nothing too fancy is going on here.
@@ -550,5 +550,5 @@ lai_segments <- rbind(goudie_edges, goudie_reserves) |>
   st_set_agr("constant") |> 
   st_cast("LINESTRING")
 
-st_write(lai_segments, "00_Shapes/line_segments.gpkg", append = FALSE)
+st_write(lai_segments, "00_input_data/line_segments.gpkg", append = FALSE)
 ```

@@ -32,7 +32,7 @@ date_filter <- "2022-09-28"
 # names for things
 # First, load the trees file and make sure that only a single year of trees 
 # is being loaded.
-goudie_trees <- st_read("00_Shapes/trees.gpkg", quiet = TRUE) |> 
+goudie_trees <- st_read("00_input_data/trees.gpkg", quiet = TRUE) |> 
   separate_wider_delim(block, delim = "_", names = c("block", "date")) |> 
   st_sf() |> 
   filter(date == date_filter) |> 
@@ -40,7 +40,8 @@ goudie_trees <- st_read("00_Shapes/trees.gpkg", quiet = TRUE) |>
 
 # Read in the strip edges (non-segmented, i.e.: the original (multi)line features 
 # for the edges of each reserve; not sure if this layer is needed):
-goudie_strip_edges <- st_read("00_Shapes/Goudie_Strip_Edges.gpkg", quiet=TRUE) |> 
+goudie_strip_edges <- st_read("00_input_data/Goudie_Strip_Edges.gpkg", 
+                              quiet = TRUE) |> 
   st_transform(st_crs(goudie_trees)) |> 
   select(-Treatment) |> 
   mutate(width = case_when(
@@ -54,10 +55,10 @@ goudie_strip_edges <- st_read("00_Shapes/Goudie_Strip_Edges.gpkg", quiet=TRUE) |
 
 # Read in the segmented lines from last script - these are shorter segments for
 # use in producing the  LAS files needed for calculating LAI
-lai_segments <- st_read("00_Shapes/line_segments.gpkg", quiet = TRUE)
+lai_segments <- st_read("00_input_data/line_segments.gpkg", quiet = TRUE)
 
 # Read in the Goudie shape layer:
-goudie <- st_read("00_Shapes/Goudie.gpkg", quiet = TRUE) |> 
+goudie <- st_read("00_input_data/Goudie.gpkg", quiet = TRUE) |> 
   st_transform(st_crs(goudie_trees)) |> 
   mutate(width = case_when(
     substr(ID, 2, 2) == "2" ~ 10,
@@ -279,7 +280,7 @@ tree_bound <- goudie_trees |>
 
 tree_bind <- rbind(tree_assign, tree_strips, tree_control, tree_bound)
 
-st_write(tree_bind, "00_Shapes/trees_attributed.gpkg", append = FALSE, 
+st_write(tree_bind, "00_input_data/trees_attributed.gpkg", append = FALSE, 
          quiet = TRUE)
 
 ```
@@ -288,7 +289,7 @@ st_write(tree_bind, "00_Shapes/trees_attributed.gpkg", append = FALSE,
 
 ```{r}
 
-tree_assign <- st_read("00_Shapes/trees_attributed.gpkg", quiet = TRUE)
+tree_assign <- st_read("00_input_data/trees_attributed.gpkg", quiet = TRUE)
 
 library(lidR)
 

@@ -1,0 +1,453 @@
+---
+title: "01_LAS_Prep"
+author: "Matthew Coghill"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+Use this for the preparation of the LAS files before further processing. This includes clipping, tiling, noise cleaning, and hei
+
+Use this for the preparation of the LAS files before further processing. This includes clipping, tiling, noise cleaning, and height normalization. First, load the required packages.
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "lidR", "data.table", "future.apply", "sf", "sfheaders")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+```
+
+2 custom functions have been created below, and one other function is loaded in from a separate R script. The first custom function is used to create the tile shapes that intersect with the shape of the Goudie study area so that data outside of that area isn't processed for speeding things up. The second custom function performs noise classification and cleaning, ground classification, and height normalization. This will be used after the tiling. Further details are given below for defending my choice of each algorithm. The function that is loaded from the R script will hopefully allow for choosing the optimum core parameters for multicore use on any machine.
+
+The `lidR` package as of January 10, 2023 only has 2 noise classification algorithms. There is either the `sor()` or `ivf()` algorithm. `sor()` is based on statistical outliers removal methods that were used in other software, and `ivf()` is based on an isolated voxels filter and is similar to methods used for noise classification in a popular LiDAR analysis tool LAStools. The LAStools noise classification standard can be found here in the associated README file: <https://rapidlasso.com/lastools/lasnoise/>
+
+"The default for 'step' is 4 and for 'isolated' is 5"
+
+"step" is analogous to the parameter "res" and "isolated" is analogous to "n". See the examples in the README to understand better.
+
+Ground classification uses the `csf()` algorithm, or "cloth-simulated filter". More information about that algorithm can be found here: <https://r-lidar.github.io/lidRbook/gnd.html#csf.> This algorithm was chosen against the other 2 provided algorithms (`pmf()` and `mcc()`) for a few reasons: First, the method is described by Zhang et al. (2016). The `pmf()` algorithm was described by the same authors, but in 2003; thus, these authors have had time to understand how to classify ground points with their newer algorithm. Second, it is a fast algorithm for determining ground points from a point cloud. Third, out of all provided ground classification algorithms it is the newest one provided in this package using published methods. Finally, no parameters are required to be adjusted here for determining ground points. In some scenarios, the `sloop_smooth` parameter should be set to `TRUE`, but for our cases it is not necessary.
+
+Finally, height normalization uses the `tin()` algorithm, the "triangular irregular network" or spatial interpolation based on a Delaunay triangulation. This is a popular algorithm to use for height normalization compared to `kriging()` and `knnidw()`, as well as being relatively effortless to use when it comes to its parameters.
+
+```{r Functions}
+
+# Get clipping shapes for catalog
+catalog_shapes <- function(ctg, clip_shp, id) {
+  output <- do.call(rbind, lapply(engine_chunks(ctg), function(xx) {
+    st_as_sf(st_as_sfc(st_bbox(xx))) |>
+      cbind(t(as.matrix(st_bbox(xx)))) |>
+      mutate(filename = paste0(paste(id, xmin, ymin, sep = "_"), ".las"),
+             block = id) |>
+      relocate(c(block, filename), 1)
+  })) |> st_set_agr("constant") |>
+    st_intersection(st_geometry(clip_shp))
+}
+
+# LAS cleaning, classification, and normalization
+ctg_clean <- function(las) {
+  las <- classify_noise(las, ivf(res = 4, n = 15))
+  las <- filter_poi(las, Classification != LASNOISE)
+  las <- classify_ground(las, csf())
+  las <- normalize_height(las, tin(), add_lasattribute = TRUE, Wdegenerated = FALSE)
+  return(las)
+}
+
+```
+
+Now we need to define the directories where the Goudie shapes are and where outputs will be stored. The raw point clouds from DJI Terra should be placed into the following folder structure:
+
+/01_las/{BlockID_Date}/cloud_merged.las
+
+Directories are created for the outputs of the tiling process and the combo cleaning and normalizing process. A directory is also created for some tree data, though it is limited in scope in this file.
+
+```{r Set directories}
+
+# Set input directories and create output directories
+shape_dir <- file.path("./00_Shapes")
+las_dir <- file.path("./01_las")
+tile_dir <- file.path("./02_tile")
+norm_dir <- file.path("./03_clean_norm")
+tree_dir <- file.path("./04_tree_seg")
+terrain_dir <- file.path("./05_terrain")
+
+# List the raw files
+las_files <- list.files(las_dir, pattern = ".las$", full.names = TRUE, 
+                        recursive = TRUE)
+
+# 2022 only
+las_files <- las_files[grep("_2022.*\\.las$", las_files)]
+
+# Get the names of the blocks by the folders the las files are in
+blocks <- basename(dirname(las_files))
+
+```
+
+The first thing that gets done is separating the single large LAS file into smaller 150m x 150m chunks. This limits the amount of data loaded during computations on your PC. It sometimes allows for faster computations as well depending on the algorithms used.
+
+For both 2021 and 2022, the KM1210 block was flown using 2 separate flights for the northern and the southern regions. This creates an overlap with too much data, so there is a need to separate out those regions and only use one of the flights over one spatial area. All other flights were much more simple.
+
+```{r Process into chunks}
+
+# Tile size
+ts <- 150
+
+# Set parallel environment
+if(availableCores() >= 4) {
+  set_lidr_threads(ceiling(availableCores() * 0.25))
+  plan(multisession, workers = floor(availableCores() / get_lidr_threads()))
+} else {
+  set_lidr_threads(0)
+  plan(sequential)
+}
+
+ctgs_tiled <- lapply(blocks, function(b) {
+  
+  # Create the output directory
+  block_dir <- file.path(tile_dir, b)
+  
+  # Read in the single large LAS file as a catalog
+  las_in <- file.path(las_dir, b, "cloud_merged.las")
+  ctg <- readUAVLAScatalog(las_in)
+  
+  # Load in block shape, transform to las CRS, and buffer the edges to account 
+  # for edge effects during future processing
+  aoi <- st_read(file.path(shape_dir, "Goudie.gpkg"), quiet = TRUE) |> 
+    st_transform(st_crs(ctg)) |> 
+    dplyr::filter(Treatment == "Boundary", startsWith(b, Block)) |> 
+    sf_remove_holes() |> 
+    st_buffer(25) |> 
+    st_set_agr("constant")
+  
+  # For block KM1210, there are 2 discrete areas and they were collected from
+  # two different flights. I want to make sure that there is no overlap from 
+  # the two flights, so I need to filter, for example, flight 1 data to fit one
+  # of the KM1210 shapes, and flight 2 to fit the other KM1210 shape. This can 
+  # be accomplished by looking at the differences between each consecutive 
+  # time that they were collected, and if that difference is larger than 300
+  # seconds (i.e.: 5 minutes), then that identifies that 2 flights were taken
+  # for a single block.
+  
+  if(nrow(aoi) > 1) {
+    
+    # Read the large las file to get just GPS time and separated by minimum 1 
+    # second. Use all lidR threads
+    las <- readLAS(las_in, select = "t", filter = "-thin_points_with_time 1")
+    
+    # Sort the data by the time it was acquired, and add a time difference
+    # attribute from between each time point
+    las@data <- setorder(las@data, gpstime)
+    las <- add_attribute(las, c(diff(las$gpstime), 0), "diff")
+    max_diff <- max(las$diff)
+    
+    # Get the in-between time for the two flights to identify each las object
+    las_split_time <- las$gpstime[which.max(las$diff)] + (max_diff / 2)
+    
+    # Clip point clouds based on GPS times, write files appending with either
+    # a 1 or 2 denoting which split these files are from
+    ctgs <- lapply(1:2, function(x) {
+      if(x == 1) {
+        las_split <- filter_poi(las, gpstime > las_split_time)
+        flt <- paste("-drop_gps_time_below", las_split_time)
+      } else {
+        las_split <- filter_poi(las, gpstime < las_split_time)
+        flt <- paste("-drop_gps_time_above", las_split_time)
+      }
+      
+      ctg_mid <- st_bbox(las_split) |> 
+        st_as_sfc() |> 
+        st_centroid()
+      aoi_filter <- st_filter(aoi, ctg_mid)
+      
+      # Load in the whole LAS file following the split times. Use a 150m chunk 
+      # size and 0m buffer, and align the chunks to the aoi_pt. Generate the shape
+      # of the chunks to be processed by clipping the chunks with the AOI. This is
+      # effectively catalog_retile but also includes clipping at the same time.
+      ctg_split <- readUAVLAScatalog(
+        las_in, filter = flt, chunk_size = ts, chunk_buffer = 0)
+      opt_chunk_alignment(ctg_split) <- c(ts, ts)
+      ctg_shps <- catalog_shapes(ctg_split, aoi_filter, b)
+      opt_output_files(ctg_split) <- file.path(
+        block_dir, paste0("{block}_{xmin}_{ymin}_", x))
+      ctg_clip <- clip_roi(ctg_split, ctg_shps)
+    })
+    
+    # Get the names of all files and the files that overlap with each other
+    all_files <- c(ctgs[[1]]$filename, ctgs[[2]]$filename)
+    bind_files <- all_files[gsub("_1.las$", "", all_files) %in% 
+      gsub("_2.las$", "", all_files)]
+    
+    # Rename the non-overlapping files to the output directory and rename them to
+    # lose the _1 or _2 suffixes
+    las_save <- all_files[!all_files %in% c(
+      bind_files, gsub("_1.las$", "_2.las", bind_files))]
+    las_rename <- gsub("_1.las$|_2.las$", ".las", las_save)
+    invisible(file.rename(las_save, las_rename))
+    
+    # Combine the overlapping files by matching file names and using rbind, and
+    # then writing them to the output directory without the _1 suffix
+    bind <- future_sapply(bind_files, function(i) {
+      j <- gsub("_1.las$", "_2.las", i)
+      ctg_sep <- readUAVLAScatalog(c(i, j), chunk_size = ts, chunk_buffer = 0)
+      opt_output_files(ctg_sep) <- file.path(
+        block_dir, gsub("_1.las$", "", basename(i)))
+      ctg_bind <- catalog_retile(ctg_sep)
+      unlink(c(i, j))
+    }, future.seed = NULL)
+    
+  } else {
+    
+    # If it's only 1 file and flight time for the whole area, proceed with a 
+    # tiling and clipping to the tile shapes
+    opt_chunk_buffer(ctg) <- 0
+    opt_chunk_size(ctg) <- ts
+    opt_chunk_alignment(ctg) <- c(ts, ts)
+    ctg_shps <- catalog_shapes(ctg, aoi, b)
+    opt_output_files(ctg) <- file.path(block_dir, "{block}_{xmin}_{ymin}")
+    block_clip <- clip_roi(ctg, ctg_shps)
+  }
+  
+  # Read in the output folder as a LAS catalog, and generate lax index files
+  block_clip <- readUAVLAScatalog(block_dir)
+  lidR:::catalog_laxindex(block_clip)
+  
+  # Generate chunk shapes to write as a geopackage
+  # opt_chunk_buffer(block_clip) <- 0
+  # opt_chunk_size(block_clip) <- ts
+  # opt_chunk_alignment(block_clip) <- c(ts, ts)
+  # block_shps <- catalog_shapes(
+  #   block_clip, st_buffer(st_as_sfc(st_bbox(aoi)), ts*2), b)
+  # st_write(block_shps, file.path(block_dir, paste0(b, "_chunks.gpkg")),
+  #          quiet = TRUE, append = FALSE)
+  
+  return(block_clip)
+}) |> setNames(blocks)
+
+plan(sequential)
+gc()
+
+```
+
+With the tiles of the raw data created, we can now do the cleaning, ground classification, and height normalization in one function. This is repeated for each of the blocks within the `lapply()` loop.
+
+```{r Clean and normalize}
+
+set_lidr_threads(2)
+plan(list(
+  tweak(multisession, workers = 3),
+  tweak(multisession, workers = 3)
+))
+
+clean_norm <- future_lapply(blocks, function(x) {
+  
+  # Create output directory for cleaned, classified, and normalized tiles
+  out_dir <- file.path(norm_dir, x)
+  
+  # Read in the LAS catalog and set some parameters for its output
+  block <- readUAVLAScatalog(file.path(tile_dir, x), chunk_buffer = 15)
+  opt_output_files(block) <- file.path(out_dir, "{*}")
+  # plan(multisession, workers = min(availableCores() / 2, nrow(block)))
+  
+  # Run the ctg_clean function created above in parallel and create .lax files
+  # for faster indexing in future functions.
+  output <- catalog_map(block, ctg_clean)
+  lidR:::catalog_laxindex(output)
+  return(output)
+}, future.seed = NULL) |> setNames(blocks)
+
+plan(sequential)
+gc()
+```
+
+Tree segmentation - I did create a lidR.li2012enhancement function (available on GitHub), however I have not implemented it here.
+
+```{r}
+
+blocks <- dir(norm_dir)
+
+# Set height threshold for height to be considered as a tree
+th_tree <- 12
+set_lidr_threads(1L)
+
+# Set multisession plan: can be memory intensive, so adjust if needed:+
+lotsaRAM <- TRUE
+
+if(lotsaRAM) {
+  outer <- min(4, length(blocks))
+  plan(list(
+    tweak(multisession, workers = outer),
+    tweak(multisession, workers = availableCores() %/% outer)
+  ))
+} else {
+  plan(list(
+    tweak(sequential),
+    tweak(multisession)
+  ))
+}
+
+options(future.globals.maxSize = 120*1024*1024*1024 / 32)
+
+tree_seg <- lapply(blocks, function(x) {
+  
+  set_lidr_threads(1L)
+  
+  # Create output directory for tree segmented tiles
+  out_dir <- file.path(tree_dir, x)
+  unnorm_out <- file.path(terrain_dir, x)
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  dir.create(unnorm_out, showWarnings = FALSE, recursive = TRUE)
+  temp_out_dir <- file.path("TEMP", x)
+  
+  # Read in the LAS catalog and set some parameters for its output
+  block <- readUAVLAScatalog(file.path(norm_dir, x), chunk_buffer = 15, 
+                             filter = "-drop_z_below 0 -drop_class 2")
+  
+  # Arrange block files by npoints
+  block@data <- arrange(block@data, desc(Number.of.point.records))
+  
+  opt_output_files(block) <- file.path(temp_out_dir, "{*}")
+  
+  ## SIDE QUEST: FIND TALLEST TREE IN BLOCK
+  tree_rads <- future_sapply(block$filename, function(y) {
+    
+    # Get max Z value from las tile; subtract 0.01 from that to ensure we get 
+    # points when we read the file in
+    maxz <- block$Max.Z[which(block$filename == y)] - 0.01
+    
+    # Read in the tile only to get the XY position of the tallest tree
+    tile <- readLAS(y, filter = paste("-drop_z_below", maxz), select = "xyz")
+    
+    # Now read in point cloud data from the area with the tallest tree. Only
+    # read in a max radius of 10m from the place where the tallest tree is
+    # located, only read in the XYZ and return number/number of return columns,
+    # and only the points that are not ground point classified.
+    tall_tree <- readLAS(y, filter = paste(
+      "-drop_class 2 -keep_circle", 
+      tile$X[which.max(tile$Z)], tile$Y[which.max(tile$Z)], 10),
+      select = "xyzrn")
+    
+    # Remove noise
+    tall_tree <- classify_noise(tall_tree, ivf(res = 1, n = 5))
+    tall_tree <- filter_poi(tall_tree, Classification != LASNOISE)
+    
+    # Locate trees using a local maximum filter. Can be simple; just looking for
+    # the tallest trees here.
+    ttops <- locate_trees(tall_tree, lmf(2))
+    
+    # Create CHM of tall trees for use in the next algorithm
+    chm <- rasterize_canopy(
+      tall_tree, res = 0.25, algorithm = pitfree(max_edge = c(1, 1)))
+    
+    # Segment trees in the LAS file
+    algo <- dalponte2016(chm, ttops)
+    tree_seg <- segment_trees(tall_tree, algo)
+    
+    # Calculate tree area; return the widest tree
+    tree_shp <- crown_metrics(tree_seg, .stdtreemetrics) |> 
+      slice_max(convhull_area, n = 1)
+    tree_rad <- sqrt(tree_shp$convhull_area / pi)
+  }, future.seed = NULL)
+  
+  tree_rad <- ceiling(max(tree_rads))
+  
+  # Run ITS, and change the `future` plan to `sequential` to close the
+  # processes and free up RAM
+  trees <- segment_trees(block, li2012(hmin = th_tree, speed_up = tree_rad),
+                         uniqueness = "bitmerge")
+  
+  # In the above process, ground points were filtered out before processing
+  # to increase the processing speed of the tree segmentation algorithm and
+  # because it doesn't make sense for ground points to be labelled as a tree.
+  # Here, we need to rebind the tree points and ground points together. We can
+  # accomplish that by loading separate LAS objects and then using rbindlist()
+  block_files <- block$filename
+  las_combine <- future_sapply(block_files, function(i) {
+    
+    # Identify the associated output tile with segmented trees from the
+    # original tile
+    tree_file <- trees$filename[
+      which(startsWith(
+        substr(basename(trees$filename), 1, nchar(basename(trees$filename)) - 4),
+        substr(basename(i), 1, nchar(basename(i)) - 4)))]
+    
+    if(length(tree_file)) {
+      
+      # If trees were segmented, bind the segmented tree file with the ground
+      # classified points in the tile it originated from
+      las_trees <- readLAS(tree_file)
+      las_grnd <- readLAS(i, filter = "-drop_z_below 0 -keep_class 2")
+      las_trees@data <- data.table::rbindlist(list(
+        las_trees@data, las_grnd@data), fill = TRUE)
+    } else {
+      
+      # If no trees were segmented, load the tile with all points
+      las_trees <- readLAS(i, filter = "-drop_z_below 0")
+    }
+    
+    # Write the bound tile with an associated .lax file
+    writeLAS(las_trees, file.path(out_dir, basename(i)), index = TRUE)
+    
+    # Unnormalize the heights of the LAS file (returns to true heights), and
+    # write to a LAS file
+    las_unnorm <- unnormalize_height(las_trees)
+    writeLAS(las_unnorm, file.path(unnorm_out, basename(i)), index = TRUE)
+    return(file.path(out_dir, basename(i)))
+  }, future.seed = NULL)
+})
+
+unlink("TEMP", recursive = TRUE)
+plan(sequential)
+gc()
+```
+
+Create the shapes of the crowns here, which will be used in the next script.
+
+```{r}
+
+# Parallel processing not working as intended right now.
+# if(lotsaRAM) {
+#   outer <- min(4, length(blocks))
+#   plan(list(
+#     tweak(multisession, workers = outer),
+#     tweak(multisession, workers = availableCores() %/% outer)
+#   ))
+# } else {
+#   plan(list(
+#     tweak(sequential),
+#     tweak(multisession)
+#   ))
+# }
+
+# Do this instead, it at least works.
+plan(multisession)
+
+blocks <- dir(tree_dir)
+
+# Should be future_lapply({}, future.seed = FALSE)
+tree_shps <- lapply(blocks, function(x) {
+  
+  las_trees <- readUAVLAScatalog(file.path(tree_dir, x), chunk_buffer = 15, 
+                                 filter = "-drop_z_below 0 -drop_class 2")
+  
+  crowns <- crown_metrics(
+    las_trees, .stdtreemetrics, geom = "concave", concaveman = c(1, 0))
+  
+  if(!inherits(crowns, "sf")) {
+    crowns <- crowns[sapply(crowns, nrow) > 0]
+    crowns <- data.table::rbindlist(crowns)
+    crowns <- sf::st_as_sf(crowns)
+    sf::st_crs(crowns) <- st_crs(las_trees)
+    bbox <- st_bbox(las_trees)
+    attributes(bbox)$crs <- NULL
+    attributes(sf::st_geometry(crowns))$bbox <- bbox
+  }
+  
+  crowns <- crowns |> 
+    mutate(block = x) |> 
+    dplyr::relocate(block, 1) |>  
+    dplyr::relocate(geometry, .after = last_col())
+})
+  
+trees <- do.call(rbind, tree_shps)
+st_write(trees, file.path(shape_dir, "trees.gpkg"), append = FALSE)
+```

@@ -1,0 +1,554 @@
+---
+title: "02_Line segments"
+author: "Matthew Coghill"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Line Segments
+
+This script will take the segmented lines and provide individual attributes to each of the line segments for the purpose of LAI estimation later on. Each individual line had to be done separately because sometimes lines were drawn in one direction, and other times in other directions, thus there is a lot of copy/pasting going on here with minor changes. This script, while a bit lengthy, is fairly simple as it is just doing some data wrangling to get all of the pieces together.
+
+First, load the required packages and define where the line segments are located.
+
+```{r}
+library(tidyverse)
+library(sf)
+seg_dir <- file.path("00_Shapes/Line Segments/")
+```
+
+Now, it's all just data wrangling, nothing too fancy is going on here.
+
+## Block KM1209 edges
+
+```{r}
+
+km1209_10m_N_edges <- st_read(
+  file.path(seg_dir, "KM1209 Edges/09_10m_N_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 10, orientation = "EW", aspect = "N", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:35 ~ "T2A",
+    id %in% 36:70 ~ "T2B",
+    id %in% 71:102 ~ "T2C",
+    id %in% 103:138 ~ "T2D",
+    id %in% 139:182 ~ "T2E",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1209_10m_S_edges <- st_read(
+  file.path(seg_dir, "KM1209 Edges/09_10m_S_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 10, orientation = "EW", aspect = "S", id = rev(row_number())) |> 
+  mutate(treatment = case_when(
+    id %in% 1:35 ~ "T2A",
+    id %in% 36:70 ~ "T2B",
+    id %in% 71:102 ~ "T2C",
+    id %in% 103:136 ~ "T2D",
+    id %in% 137:177 ~ "T2E",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1209_15m_N_edges <- st_read(
+  file.path(seg_dir, "KM1209 Edges/09_15m_N_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 15, orientation = "EW", aspect = "N", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:31 ~ "T3B",
+    id %in% 32:61 ~ "T3A",
+    id %in% 62:94 ~ "T3C",
+    id %in% 95:127 ~ "T3D",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment %in% c("T3A", "T3B"), rev(id), id)) |> 
+  mutate(id = case_when(
+    treatment == "T3A" ~ id - 31,
+    treatment == "T3B" ~ id + 30,
+    TRUE ~ id
+  )) |> 
+  ungroup()
+
+km1209_15m_S_edges <- st_read(
+  file.path(seg_dir, "KM1209 Edges/09_15m_S_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 15, orientation = "EW", aspect = "S", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:29 ~ "T3A",
+    id %in% 30:58 ~ "T3B",
+    id %in% 59:91 ~ "T3C",
+    id %in% 92:124 ~ "T3D",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment %in% c("T3B", "T3C", "T3D"), rev(id), id)) |> 
+  ungroup()
+
+km1209_20m_N_edges <- st_read(
+  file.path(seg_dir, "KM1209 Edges/09_20m_N_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 20, orientation = "EW", aspect = "N", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:14 ~ "T4A",
+    id %in% 15:36 ~ "T4B",
+    id %in% 37:67 ~ "T4C",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1209_20m_S_edges <- st_read(
+  file.path(seg_dir, "KM1209 Edges/09_20m_S_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 20, orientation = "EW", aspect = "S", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:13 ~ "T4A",
+    id %in% 14:30 ~ "T4B",
+    id %in% 31:59 ~ "T4C",
+    TRUE ~ "NA"
+  ))
+
+km1209_edges <- rbind(km1209_10m_N_edges, km1209_10m_S_edges,
+                      km1209_15m_N_edges, km1209_15m_S_edges,
+                      km1209_20m_N_edges, km1209_20m_S_edges)
+```
+
+## Block KM1210 edges
+
+```{r}
+
+km1210_10m_N_edges <- st_read(
+  file.path(seg_dir, "KM1210 Edges/10_10m_N_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 10, orientation = "EW", aspect = "N", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:7 ~ "T2A",
+    id %in% 8:20 ~ "T2B",
+    id %in% 21:37 ~ "T2C",
+    id %in% 38:51 ~ "T2D",
+    id %in% 52:62 ~ "T2E2",
+    id %in% 63:74 ~ "T2E1",
+    id %in% 75:95 ~ "T2F",
+    id %in% 96:119 ~ "T2H",
+    id %in% 120:143 ~ "T2I",
+    id %in% 144:166 ~ "T2J",
+    id %in% 167:189 ~ "T2K",
+    id %in% 190:212 ~ "T2L",
+    id %in% 213:235 ~ "T2M",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(
+    treatment %in% c("T2A", "T2B", "T2C", "T2D", "T2E2", "T2F", "T2H"), 
+    rev(id), id),
+    treatment = ifelse(treatment %in% c("T2E1", "T2E2"), "T2E", treatment)) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment == "T2E", rev(id), id)) |> 
+  mutate(id = case_when(
+    id %in% 52:62 ~ id + 1,
+    id == 63 ~ 52,
+    TRUE ~ id
+  )) |> 
+  ungroup() 
+
+km1210_10m_S_edges <- st_read(
+  file.path(seg_dir, "KM1210 Edges/10_10m_S_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 10, orientation = "EW", aspect = "S", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:6 ~ "T2A",
+    id %in% 7:17 ~ "T2B",
+    id %in% 18:34 ~ "T2C",
+    id %in% 35:50 ~ "T2D",
+    id %in% 51:62 ~ "T2E",
+    id %in% 63:82 ~ "T2F",
+    id %in% 83:106 ~ "T2H",
+    id %in% 107:130 ~ "T2I",
+    id %in% 131:153 ~ "T2J",
+    id %in% 154:176 ~ "T2K",
+    id %in% 177:199 ~ "T2L",
+    id %in% 200:222 ~ "T2M",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(
+    treatment %in% c("T2I", "T2J", "T2K", "T2L", "T2M"), rev(id), id)) |> 
+  ungroup()
+
+km1210_15m_N_edges <- st_read(
+  file.path(seg_dir, "KM1210 Edges/10_15m_N_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 15, orientation = "EW", aspect = "N", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:12 ~ "T3A1",
+    id %in% 13:24 ~ "T3A2",
+    id %in% 25:42 ~ "T3B",
+    id %in% 43:75 ~ "T3C",
+    id %in% 76:105 ~ "T3D",
+    id %in% 106:131 ~ "T3E",
+    id %in% 132:150 ~ "T3F",
+    id %in% 151:161 ~ "T3G",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment == "T3B", id, rev(id)),
+         treatment = ifelse(treatment %in% c("T3A1", "T3A2"), "T3A", treatment)) |> 
+  ungroup()
+
+km1210_15m_S_edges <- st_read(
+  file.path(seg_dir, "KM1210 Edges/10_15m_S_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 15, orientation = "EW", aspect = "S", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:25 ~ "T3A",
+    id %in% 26:40 ~ "T3B",
+    id %in% 41:66 ~ "T3C",
+    id %in% 67:98 ~ "T3D",
+    id %in% 99:124 ~ "T3E",
+    id %in% 125:145 ~ "T3F",
+    id %in% 146:158 ~ "T3G",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment %in% c("T3B"), rev(id), id)) |> 
+  ungroup()
+
+km1210_20m_N_edges <- st_read(
+  file.path(seg_dir, "KM1210 Edges/10_20m_N_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 20, orientation = "EW", aspect = "N", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:11 ~ "T4A",
+    id %in% 12:26 ~ "T4B",
+    id %in% 27:38 ~ "T4C",
+    id %in% 39:50 ~ "T4D",
+    id %in% 51:66 ~ "T4E",
+    id %in% 67:79 ~ "T4F",
+    id %in% 80:88 ~ "T4G",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1210_20m_S_edges <- st_read(
+  file.path(seg_dir, "KM1210 Edges/10_20m_S_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 20, orientation = "EW", aspect = "S", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:11 ~ "T4A",
+    id %in% 12:25 ~ "T4B",
+    id %in% 26:39 ~ "T4C",
+    id %in% 40:50 ~ "T4D",
+    id %in% 51:66 ~ "T4E",
+    id %in% 67:81 ~ "T4F",
+    id %in% 82:90 ~ "T4G",
+    TRUE ~ "NA"
+  ))
+
+km1210_edges <- rbind(km1210_10m_N_edges, km1210_10m_S_edges,
+                      km1210_15m_N_edges, km1210_15m_S_edges,
+                      km1210_20m_N_edges, km1210_20m_S_edges)
+```
+
+## Block KM1212 edges
+
+```{r}
+
+km1212_10m_E_edges <- st_read(
+  file.path(seg_dir, "KM1212 Edges/12_10m_E_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 10, orientation = "NS", aspect = "E", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:8 ~ "T2B",
+    id %in% 9:21 ~ "T2C",
+    id %in% 22:39 ~ "T2D",
+    id %in% 40:60 ~ "T2E",
+    id %in% 61:82 ~ "T2F",
+    id %in% 83:106 ~ "T2G",
+    id %in% 107:132 ~ "T2H",
+    id %in% 133:160 ~ "T2I",
+    TRUE ~ "NA"
+  ))
+
+km1212_10m_W_edges <- st_read(
+  file.path(seg_dir, "KM1212 Edges/12_10m_W_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 10, orientation = "NS", aspect = "W", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:8 ~ "T2B",
+    id %in% 9:23 ~ "T2C",
+    id %in% 43:61 ~ "T2D",
+    id %in% 62:82 ~ "T2E",
+    id %in% 83:105 ~ "T2F",
+    id %in% 106:129 ~ "T2G",
+    id %in% 130:156 ~ "T2H",
+    id %in% 157:182 ~ "T2I",
+    TRUE ~ "NA"
+  )) |> 
+  filter(treatment != "NA") |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup() |> 
+  mutate(id = ifelse(id > 42, id - 19, id))
+
+km1212_15m_E_edges <- st_read(
+  file.path(seg_dir, "KM1212 Edges/12_15m_E_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 15, orientation = "NS", aspect = "E", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:22 ~ "T3A",
+    id %in% 23:34 ~ "T3B",
+    id %in% 35:50 ~ "T3C",
+    id %in% 51:64 ~ "T3D",
+    id %in% 65:75 ~ "T3E",
+    id %in% 76:87 ~ "T3F",
+    id %in% 88:94 ~ "T3G",
+    TRUE ~ "NA"
+  ))
+
+km1212_15m_W_edges <- st_read(
+  file.path(seg_dir, "KM1212 Edges/12_15m_W_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 15, orientation = "NS", aspect = "W", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:13 ~ "T3A",
+    id %in% 14:24 ~ "T3B",
+    id %in% 25:39 ~ "T3C",
+    id %in% 40:52 ~ "T3D",
+    id %in% 53:63 ~ "T3E",
+    id %in% 64:74 ~ "T3F",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1212_20m_E_edges <- st_read(
+  file.path(seg_dir, "KM1212 Edges/12_20m_E_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 20, orientation = "NS", aspect = "E", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:31 ~ "T4A",
+    id %in% 32:59 ~ "T4B",
+    id %in% 60:85 ~ "T4C",
+    TRUE ~ "NA"
+  ))
+
+km1212_20m_W_edges <- st_read(
+  file.path(seg_dir, "KM1212 Edges/12_20m_W_edge_segments.gpkg"), quiet = T) |> 
+  mutate(width = 20, orientation = "NS", aspect = "W", id = row_number()) |> 
+  mutate(treatment = case_when(
+    id %in% 1:29 ~ "T4A",
+    id %in% 30:56 ~ "T4B",
+    id %in% 57:81 ~ "T4C",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1212_edges <- rbind(km1212_10m_E_edges, km1212_10m_W_edges,
+                      km1212_15m_E_edges, km1212_15m_W_edges,
+                      km1212_20m_E_edges, km1212_20m_W_edges)
+```
+
+## Block KM1209 Reserves
+
+```{r}
+
+km1209_10m_reserves <- st_read(
+  file.path(seg_dir, "KM1209 Reserves/09_10m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) |> 
+  mutate(width = 10, orientation = "EW", id = rev(row_number())) |>   
+  mutate(treatment = case_when(
+    id %in% 1:35 ~ "R2A",
+    id %in% 36:68 ~ "R2B",
+    id %in% 69:100 ~ "R2C",
+    id %in% 101:137 ~ "R2D",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment != "R2B", rev(id), id)) |> 
+  ungroup()
+
+km1209_15m_reserves <- st_read(
+  file.path(seg_dir, "KM1209 Reserves/09_15m_reserve_segments.gpkg"), quiet = T) %>%
+  filter(!st_is_empty(.)) |> 
+  select(-fid) |> 
+  mutate(width = 15, orientation = "EW", id = rev(row_number())) |>   
+  mutate(treatment = case_when(
+    id %in% 1:30 ~ "R3A",
+    id %in% 31:63 ~ "R3B",
+    id %in% 64:96 ~ "R3C",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1209_20m_reserves <- st_read(
+  file.path(seg_dir, "KM1209 Reserves/09_20m_reserve_segments.gpkg"), quiet = T) %>%
+  filter(!st_is_empty(.)) |> 
+  select(-fid) |> 
+  mutate(width = 20, orientation = "EW", id = rev(row_number())) |>   
+  mutate(treatment = case_when(
+    id %in% 1:15 ~ "R4A",
+    id %in% 16:41 ~ "R4B",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup()
+
+km1209_reserves <- rbind(km1209_10m_reserves, km1209_15m_reserves,
+                         km1209_20m_reserves)
+```
+
+## Block KM1210 Reserves
+
+```{r}
+
+km1210_10m_reserves <- st_read(
+  file.path(seg_dir, "KM1210 Reserves/10_10m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) |> 
+  mutate(width = 10, orientation = "EW", id = row_number()) |>   
+  mutate(treatment = case_when(
+    id %in% 1:16 ~ "R2A",
+    id %in% 17:33 ~ "R2B",
+    id %in% 34:46 ~ "R2C",
+    id %in% 47:62 ~ "R2D",
+    id %in% 63:85 ~ "R2E",
+    id %in% 86:109 ~ "R2F",
+    id %in% 110:133 ~ "R2G",
+    id %in% 134:156 ~ "R2H",
+    id %in% 157:179 ~ "R2I",
+    id %in% 180:202 ~ "R2J",
+    TRUE ~ "NA"
+  ))
+
+km1210_15m_reserves <- st_read(
+  file.path(seg_dir, "KM1210 Reserves/10_15m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) |> 
+  mutate(width = 15, orientation = "EW", id = rev(row_number())) |>   
+  mutate(treatment = case_when(
+    id %in% 1:14 ~ "R3A",
+    id %in% 42:62 ~ "R3B",
+    id %in% 63:94 ~ "R3C",
+    id %in% 15:41 ~ "R3D",
+    id %in% 95:116 ~ "R3E",
+    id %in% 117:133 ~ "R3F",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = rev(id)) |> 
+  ungroup() |> 
+  mutate(id = case_when(
+    treatment %in% c("R3B", "R3C") ~ id - 27,
+    treatment == "R3D" ~ id + 53,
+    TRUE ~ id
+  ))
+
+km1210_20m_reserves <- st_read(
+  file.path(seg_dir, "KM1210 Reserves/10_20m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) |> 
+  mutate(width = 20, orientation = "EW", id = row_number()) |>   
+  mutate(treatment = case_when(
+    id %in% 1:12 ~ "R4A",
+    id %in% 13:27 ~ "R4B",
+    id %in% 28:39 ~ "R4C",
+    id %in% 40:54 ~ "R4D",
+    id %in% 55:70 ~ "R4E",
+    id %in% 71:81 ~ "R4F",
+    TRUE ~ "NA"
+  ))
+
+km1210_reserves <- rbind(km1210_10m_reserves, km1210_15m_reserves,
+                         km1210_20m_reserves)
+```
+
+## Block KM1212 Reserves
+
+```{r}
+
+km1212_10m_reserves <- st_read(
+  file.path(seg_dir, "KM1212 Reserves/12_10m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) %>% 
+  filter(!st_is_empty(.)) |> 
+  mutate(width = 10, orientation = "NS", id = row_number()) |>   
+  mutate(treatment = case_when(
+    id %in% 1:10 ~ "R2A",
+    id %in% 11:27 ~ "R2B",
+    id %in% 28:47 ~ "R2C",
+    id %in% 48:69 ~ "R2D",
+    id %in% 70:92 ~ "R2E",
+    id %in% 93:117 ~ "R2F",
+    id %in% 118:144 ~ "R2G",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment %in% c("R2A", "R2B", "R2D", "R2F", "R2G"), rev(id), id)) |> 
+  ungroup()
+
+km1212_15m_reserves <- st_read(
+  file.path(seg_dir, "KM1212 Reserves/12_15m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) |> 
+  mutate(width = 15, orientation = "NS", id = row_number()) |>   
+  mutate(treatment = case_when(
+    id %in% 1:13 ~ "R3A",
+    id %in% 14:23 ~ "R3B",
+    id %in% 24:37 ~ "R3C",
+    id %in% 38:49 ~ "R3D",
+    id %in% 50:60 ~ "R3E",
+    id %in% 61:69 ~ "R3F",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment != "R3A", rev(id), id)) |> 
+  ungroup()
+
+km1212_20m_reserves <- st_read(
+  file.path(seg_dir, "KM1212 Reserves/12_20m_reserve_segments.gpkg"), quiet = T) |> 
+  select(-fid) |> 
+  mutate(width = 20, orientation = "NS", id = row_number()) |>   
+  mutate(treatment = case_when(
+    id %in% 1:29 ~ "R4A",
+    id %in% 30:56 ~ "R4B",
+    TRUE ~ "NA"
+  )) |> 
+  group_by(treatment) |> 
+  mutate(id = ifelse(treatment == "R4B", rev(id), id)) |> 
+  ungroup()
+
+km1212_reserves <- rbind(km1212_10m_reserves, km1212_15m_reserves,
+                         km1212_20m_reserves)
+```
+
+## Finalizing
+
+With all of the line segments attributed, we can pull them all together and save them into a single file output.
+
+```{r}
+
+# All treatment edges (join with goudie_reserves to get block orientation)
+goudie_edges <- rbind(
+  mutate(km1209_edges, block = "KM1209"), 
+  mutate(km1210_edges, block = "KM1210"),
+  mutate(km1212_edges, block = "KM1212"))
+
+# All reserves:
+goudie_reserves <- rbind(
+  mutate(km1209_reserves, block = "KM1209"),
+  mutate(km1210_reserves, block = "KM1210"),
+  mutate(km1212_reserves, block = "KM1212")) |> 
+  mutate(aspect = NA)
+
+# All together
+lai_segments <- rbind(goudie_edges, goudie_reserves) |> 
+  relocate(c(block, width, treatment, orientation, aspect, id), 
+           .before = geom) |> 
+  arrange(block, treatment, orientation, aspect, id) |> 
+  mutate(id = case_when(
+    startsWith(treatment, "R") ~ paste(
+      block, treatment, orientation, sprintf("%03d", id), sep = "_"),
+    startsWith(treatment, "T") ~ paste(
+      block, treatment, aspect, sprintf("%03d", id), sep = "_"),
+    .default = "error")) |> 
+  rename(segment_id = id) |> 
+  st_set_agr("constant") |> 
+  st_cast("LINESTRING")
+
+st_write(lai_segments, "00_Shapes/line_segments.gpkg", append = FALSE)
+```

@@ -1,0 +1,182 @@
+---
+title: "04_Tree models"
+author: "Matthew Coghill"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Tree models
+
+One of the things that foresters are interested in is the potential volume of timber on the landscape. This can be calculated using one of the BC government's tools in an R package called "FAIBbase", where you essentially give the model some information (tree species, BEC zone, height, and DBH of a tree), and it can model the potential volume that tree might have. With everything that we have from this project so far, we have all of the BEC zone information, height information, and we can assume that all of the tree species are lodgepole pine; however, we don't have any information about DBH. We can, however, model DBH using data that we have gathered. This is a very simplistic model, where we will give it a trees height and it will predict the DBH of it. We can then use that DBH in the calculations for tree volumes.
+
+First, load some packages:
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "readxl", "sf", "lme4", "FAIBBase", "data.table", "units")
+invisible(lapply(ls, library, character.only = TRUE))
+rm(ls)
+setDTthreads(0L)
+install_unit("stems")
+```
+
+Next, we can load the data for the tree heights and the shapes that were created in the previous script:
+
+```{r}
+
+# Read and manipulate field data spreadsheet. Blocks not assigned in spreadsheet,
+# but can backtrack through the data to determine which blocks are which.
+field_data <- read_excel("00_field_data/2022 Tree Measurements- clean.xlsx") |> 
+  mutate(
+    width = factor(as.numeric(substr(Trt, 1, 2))),
+    orientation = factor(case_when(
+      grepl("-N$|-S$|-EW$", Trt) ~ "EW",
+      grepl("-E$|-W$|-NS$", Trt) ~ "NS",
+      .default = NA
+    )),
+    aspect = factor(case_when(
+      grepl("-N$", Trt) ~ "N", grepl("-S$", Trt) ~ "S",
+      grepl("-E$", Trt) ~ "E", grepl("-W$", Trt) ~ "W",
+      .default = NA
+    )),
+    block = factor(case_when(
+      orientation == "NS" ~ "KM1212",
+      `Tag colour` == "Y" ~ "KM1210",
+      `Tag colour` == "G" & `Tag #` %in% 1:100 ~ "KM1210",
+      `Tag colour` == "G" & `Tag #` %in% 101-270 ~ "KM1209",
+      .default = NA
+    ))) |>
+  rename(treatment = transect, height = Ht, dbh = DBH) |> 
+  select(block, treatment, width, orientation, aspect, height, dbh) |> 
+  filter(height >= 10)
+
+# Read in the tree shapes
+trees <- st_read("00_Shapes/trees_attributed.gpkg", quiet = TRUE) |> 
+  rename(height = Z) |> 
+  mutate(across(c(width, aspect, orientation, block), factor))
+
+goudie <- st_read("00_Shapes/Goudie.gpkg", quiet = TRUE)
+```
+
+Now that we have all of the data needed, we can build the models for tree heights. There are four total models: one for just the edge trees (strip width and aspect are taken into account here); one for the reserve trees (strip width and orientation are taken into account here), control trees (just the orientation of the block is taken into account), and any remaining trees (blocking used as a random effect). The DBH's are predicted and added to the dataframe, and then all dataframes are bound back together.
+
+```{r}
+
+# Data subsets
+edge_df <- field_data |> filter(startsWith(treatment, "T"))
+res_df <- field_data |> filter(startsWith(treatment, "R"))
+
+# Different models for edge trees, reserves, and all other trees
+model_edge <- lmer(dbh ~ height + (width|aspect) + (1|block), data = edge_df)
+model_res <- lmer(dbh ~ height + (width|orientation) + (1|block), data = res_df)
+model_ctrl <- lmer(dbh ~ height + orientation + (1|block), data = field_data)
+model_remain <- lmer(dbh ~ height + (1|block), data = field_data)
+
+# Add DBH to the tree data:
+tree_edge_dbh <- trees |> 
+  filter(startsWith(treatment, "T"), !is.na(aspect)) |> 
+  mutate(dbh = predict(model_edge, newdata = data.frame(
+    height, width, aspect, block)))
+
+tree_res_dbh <- trees |> 
+  filter(startsWith(treatment, "R")) |> 
+  mutate(dbh = predict(model_res, newdata = data.frame(
+    height, width, orientation, block)))
+
+tree_ctrl_dbh <- trees |> 
+  filter(startsWith(treatment, "C")) |> 
+  mutate(dbh = predict(model_ctrl, newdata = data.frame(
+    height, orientation, block)))
+
+tree_remain_dbh <- trees |> 
+  filter(!treeID %in% c(tree_edge_dbh$treeID, tree_res_dbh$treeID,
+                        tree_ctrl_dbh$treeID)) |> 
+  mutate(dbh = predict(model_remain, newdata = data.frame(
+    height, block)))
+
+# Bind them all back together
+trees_dbh <- rbind(tree_edge_dbh, tree_res_dbh, tree_ctrl_dbh, tree_remain_dbh)
+```
+
+Now that the DBH's of each tree have been modelled, we can now use the tree volume calculator within the FAIBBase package to get the volume of each tree. This can then be summarized to show things like stem density, volumes in each reserve, whether strip orientation or width has an effect on tree volumes, etc.
+
+```{r}
+
+trees_vol <- cbind(
+  trees_dbh,
+  treeVolCalculator(
+    FIZorBEC = "MS", species = "PL", 
+    height = trees_dbh$height, DBH = trees_dbh$dbh)) |> 
+  rename(whole_tree_vol = VOL_WSV, total_merch_vol = VOL_BELOW_UTOP,
+         stump_vol = VOL_STUMP, non_merch_vol = VOL_ABOVE_UTOP) |> 
+  select(-c(HT_STUMP, DIB_STUMP, HT_BH, DIB_BH, HT_UTOP, DIB_UTOP)) |> 
+  mutate(full_id = case_when(
+    startsWith(treatment, "T") & !is.na(aspect) ~ paste(block, treatment, aspect, sep = "_"),
+    .default = paste(block, treatment, sep = "_")
+  )) |> 
+  relocate(full_id) |> 
+  relocate(attr(trees_dbh, "sf_column"), .after = last_col())
+
+# Write to a GeoPackage file
+st_write(trees_vol, "00_Shapes/trees_measured.gpkg", append = FALSE, 
+         quiet = TRUE)
+```
+
+Look at some summarized statistics for these trees and their volumes. Write the data to .csv files.
+
+```{r}
+
+trt_ids <- na.omit(unique(trees_vol$full_id))
+
+trees_summary <- do.call(rbind, lapply(trt_ids, function(x) {
+  
+  # Print progress
+  print(paste("Working on", x, paste0(
+    "[", which(x == trt_ids), " of ", length(trt_ids), "]")))
+  
+  # Create a summarized dataframe with total merchantible timber, and then mean,
+  # min, max, and SD's of other tree related values
+  tree_flt <- filter(trees_vol, full_id == x) |> 
+    group_by(full_id, block, treatment, aspect, width, orientation) |> 
+    summarise(
+      across(
+        c(stump_vol, whole_tree_vol, total_merch_vol, non_merch_vol), sum, 
+        .names = "total_{.col}"),
+      across(
+        c(height, dbh, convhull_area), list(
+          min = ~min(.x, na.rm = TRUE), 
+          mean = ~mean(.x, na.rm = TRUE), 
+          max = ~max(.x, na.rm = TRUE),
+          sd = ~sd(.x, na.rm = TRUE)), .names = "{.col}.{.fn}"),
+      stems = set_units(n(), "stems"),
+    .groups = "drop") |> 
+    rename(total_merch_vol = total_total_merch_vol)
+    
+  # Known sparse "forests" will overestimate stems/ha calculation, so detect
+  # those ones and remove them from being calculated
+  if((grepl("_T", x) & !grepl("_S$|_N$|_E$|_W$", x)) || grepl("_B", x)) {
+    tree_area <- set_units(NA, "ha")
+  } else {
+    tree_area <- st_union(tree_flt) |> 
+      st_concave_hull(ratio = .01, allow_holes = F) |> 
+      st_area() |> 
+      set_units("ha")
+  }
+  
+  # Calculate stems/ha
+  tree_sum <- cbind(tree_flt, area = tree_area) |> 
+    mutate(density = stems / area) |> 
+    relocate(attr(tree_flt, "sf_column"), .after = last_col())
+})) |> arrange(full_id)
+
+# Write data
+dir.create("07_tree_data", showWarnings = FALSE)
+
+write.csv(st_drop_geometry(trees_vol), file.path(
+  "07_tree_data/tree_measurements.csv"), row.names = FALSE)
+
+write.csv(st_drop_geometry(trees_summary), file.path(
+  "07_tree_data/tree_summary.csv"), row.names = FALSE)
+```

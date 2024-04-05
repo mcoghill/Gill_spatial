@@ -1,0 +1,354 @@
+---
+title: "03_Tree organization"
+author: "Matthew Coghill"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Tree organization
+
+In the previous script, all of the LiDAR data was properly handled, and shapes for the trees were generated. Now, we need to provide attributes to each of the trees for which block they belong to, what treatment they are a part of, and if they are classified as an edge tree or reserve tree. This script is truly an exercise in spatial manipulation of shapes.
+
+First, load packages. The `rmapshaper` package has a useful function `ms_simplify()` which is used later on to pinch off sharp angled shapes from a polygon, and the `lwgeom` package allows for slicing a line at given points with the `st_split()` function.
+
+```{r Packages, warning=FALSE, message=FALSE}
+
+ls <- c("tidyverse", "sf", "sfheaders", "rmapshaper", "lwgeom", "future.apply")
+invisible(lapply(ls, library, character.only = TRUE))
+options(future.globals.maxSize = 20*1024*1024*1024)
+rm(ls)
+```
+
+Now let's read in the shapes that we will need. Care is taken below to ensure that column naming conventions between each of the spatial layers is the same for ease of viewing and analysis.
+
+```{r}
+
+# Define filter for date (same GeoPackage has trees identified for both years)
+date_filter <- "2022-09-28"
+
+# Read in the shapes, wrangle data so that each shape has the same column
+# names for things
+# First, load the trees file and make sure that only a single year of trees 
+# is being loaded.
+goudie_trees <- st_read("00_Shapes/trees.gpkg", quiet = TRUE) |> 
+  separate_wider_delim(block, delim = "_", names = c("block", "date")) |> 
+  st_sf() |> 
+  filter(date == date_filter) |> 
+  select(-date)
+
+# Read in the strip edges (non-segmented, i.e.: the original (multi)line features 
+# for the edges of each reserve; not sure if this layer is needed):
+goudie_strip_edges <- st_read("00_Shapes/Goudie_Strip_Edges.gpkg", quiet=TRUE) |> 
+  st_transform(st_crs(goudie_trees)) |> 
+  select(-Treatment) |> 
+  mutate(width = case_when(
+    substr(StripID, 2, 2) == "2" ~ 10,
+    substr(StripID, 2, 2) == "3" ~ 15,
+    substr(StripID, 2, 2) == "4" ~ 20,
+    .default = NA)) |> 
+  rename(block = Block, treatment = StripID, aspect = Aspect) |> 
+  relocate(width, .after = block) |> 
+  arrange(block, treatment, aspect)
+
+# Read in the segmented lines from last script - these are shorter segments for
+# use in producing the  LAS files needed for calculating LAI
+lai_segments <- st_read("00_Shapes/line_segments.gpkg", quiet = TRUE)
+
+# Read in the Goudie shape layer:
+goudie <- st_read("00_Shapes/Goudie.gpkg", quiet = TRUE) |> 
+  st_transform(st_crs(goudie_trees)) |> 
+  mutate(width = case_when(
+    substr(ID, 2, 2) == "2" ~ 10,
+    substr(ID, 2, 2) == "3" ~ 15,
+    substr(ID, 2, 2) == "4" ~ 20,
+    .default = NA)) |> 
+  select(-Treatment) |> 
+  rename(block = Block, orientation = Strip_Orientation, treatment = ID) |> 
+  relocate(c(width, treatment, orientation), .after = block) |> 
+  arrange(block, treatment)
+```
+
+Above, we have simply read in the various shapes. Now, we want to apply some functions to these shapes so that we can do the following:
+
+1.  For the non-segmented lines, identify the adjacent reserve. This will be useful in detecting "edge trees" along those lines later on so that we don't accidentally get trees from other reserve areas.
+
+```{r}
+
+reserve_poly <- goudie |> 
+  filter(startsWith(treatment, "R"))
+
+strip_edges <- goudie_strip_edges |> 
+  st_join(reserve_poly, join = st_is_within_distance, dist = 1, 
+          suffix = c("", "_adjacent")) |> 
+  st_set_agr("constant") |> 
+  select(-c(block_adjacent, width_adjacent))
+```
+
+2.  Adjust the position of the lines so that they are slightly more within the strips. A polygon will be created from this, which will be used later to union with the reserves. This allows us to essentially create a buffer of the reserves, except that the extension of the polygon will only go into the strips and not out towards the road or into the boundary of the block. This larger reserve polygon essentially allows segmented trees from within the strips to be assigned to a reserve.
+
+```{r}
+
+# Get the geometry attribute
+g <- attr(strip_edges, "sf_column")
+strip_edges[[g]][strip_edges$aspect == "S"] <- strip_edges[[g]][
+  strip_edges$aspect == "S"] - c(0, 2.4)
+
+strip_edges[[g]][strip_edges$aspect == "N"] <- strip_edges[[g]][
+  strip_edges$aspect == "N"] + c(0, 2.4)
+
+strip_edges[[g]][strip_edges$aspect == "W"] <- strip_edges[[g]][
+  strip_edges$aspect == "W"] - c(2.4, 0)
+
+strip_edges[[g]][strip_edges$aspect == "E"] <- strip_edges[[g]][
+  strip_edges$aspect == "E"] + c(2.4, 0)
+
+# Create polygon of lines by buffering:
+strip_edges_poly <- st_buffer(strip_edges, 2.4, endCapStyle = "FLAT")
+
+# Connect the buffered strip edge polygon with the reserve polygons:
+reserve_poly_buf <- rbind(
+  reserve_poly, 
+  strip_edges_poly |> 
+    select(-c(treatment, aspect)) |> 
+    rename(treatment = treatment_adjacent)) |> 
+  group_by(block, treatment) |> 
+  summarise(.groups = "drop") |> 
+  st_cast("MULTIPOLYGON") |> 
+  left_join(st_drop_geometry(reserve_poly), suffix = c("", ".x")) |> 
+  select(-ends_with(".x")) |> 
+  filter(!is.na(treatment)) |> 
+  relocate(block, treatment, width, orientation)
+
+```
+
+3.  Filter Goudie object for strips, reserves, controls, and boundaries. We will need these shapes later to assign which trees belong to which grouping (control, strip, or boundary).
+
+```{r}
+control_poly <- dplyr::filter(goudie, startsWith(treatment, "C"))
+strip_poly <- dplyr::filter(goudie, startsWith(treatment, "T"))
+bound_poly <- dplyr::filter(goudie, startsWith(treatment, "B")) |> 
+  st_set_agr("constant")
+```
+
+4.  Create a shape of the forested area that is not a strip, reserve, or control within the boundaries of each block. For strip edges that did not have an adjacent reserve (i.e.: the harvested strip edge butts up against the block boundary), these would have had `NA` values in their `treatment_adjacent` column. We can fill those `NA` values with the block ID as the treatment (i.e.: the adjacent forest is not from a reserve, but belongs to the block ID).
+
+```{r}
+
+strip_edges_na <- strip_edges |> 
+  filter(is.na(treatment_adjacent)) |> 
+  select(block, width, treatment, aspect) |> 
+  st_join(bound_poly, suffix = c("", "_adjacent")) |> 
+  select(all_of(names(strip_edges)))
+
+strip_edges <- rbind(
+  strip_edges |> filter(!is.na(treatment_adjacent)),
+  strip_edges_na)
+
+```
+
+5.  Assign trees to the reserves in which they belong to. Then, go through each of the reserve polygons and further classify whether a tree is along an edge or if it is within the reserve. Further classify that delineation using the segmented lines so that each tree will have their own tree ID, the segment that they belong to, and whether or not they are along the edges of the reserve or not. Once the critical trees are classified, we can classify the trees within the middle of the strips, the trees in the controls, and the trees that fall within the boundary of each block. This shape is then written to a GeoPackage file.
+
+```{r}
+
+# Assign reserve ID's to each tree
+tree_site <- st_join(goudie_trees, reserve_poly_buf, suffix = c("", ".x"), 
+                     largest = TRUE) |> 
+  filter(!is.na(block.x)) |> 
+  mutate(reserve_id = paste0(block.x, "_", treatment)) |> 
+  select(-block) |> 
+  rename(block = block.x) |> 
+  relocate(reserve_id, width, treatment, orientation)
+
+# Iterate through unique reserve_id's to assign a tree either as an edge or
+# reserve
+plan(multisession)
+res_ids <- unique(tree_site$reserve_id)
+tree_assign <- do.call(rbind, future_lapply(res_ids, function(x) {
+  print(paste("Working on", x))
+  
+  # Filters for things that are needed
+  tree_reserve <- filter(tree_site, reserve_id == x)
+  reserve_poly_buf_filter <- reserve_poly_buf |>
+    filter(block %in% unique(tree_reserve$block),
+           treatment %in% unique(tree_reserve$treatment))
+  strip_edges_filter_lines <- strip_edges |>
+    filter(block %in% unique(tree_reserve$block),
+           treatment_adjacent %in% unique(tree_reserve$treatment)) |>
+    st_cast("LINESTRING")
+  
+  # Create a convex hull of the trees in the reserve, removing slivers and
+  # disjoint trees
+  reserve_hull <- st_union(tree_reserve) |> 
+    st_concave_hull(ratio = .01, allow_holes = F) |> 
+    ms_simplify(keep = 0.025) |> 
+    st_cast("LINESTRING")
+  hull_pts <- st_cast(reserve_hull, "POINT")[-1]
+  
+  # Want to sample along the reserve_hull lines, but only use lines that are
+  # closest to strip_edges_filter_lines. To do this we have to slice the line at
+  # carefully laid points:
+  reserve_hull_sample <- do.call(
+    rbind, lapply(1:nrow(strip_edges_filter_lines), function(y) {
+    
+    # Template line, end points, and mid point
+    line_temp <- strip_edges_filter_lines[y, ]
+    temp_pts <- st_cast(line_temp, "POINT")
+    temp_mid <- st_centroid(line_temp)
+    
+    # Get first and last points of template line (cutting points)
+    temp_start <- st_geometry(temp_pts[1, ])
+    temp_end <- st_geometry(temp_pts[2, ])
+    
+    # Get the nearest points of the hull line to the template start and end points
+    hull_start <- hull_pts[st_nearest_feature(temp_start, hull_pts)]
+    hull_end <- hull_pts[st_nearest_feature(temp_end, hull_pts)]
+    
+    # Split the hull line at the points created
+    hull_lines <- st_split(reserve_hull, c(hull_start, hull_end)) |> 
+      st_collection_extract("LINESTRING") 
+    
+    # Select the line closest to the midpoint, and generate attributed line
+    # samples
+    hull_nearest <- hull_lines[st_nearest_feature(temp_mid, hull_lines)] |> 
+      st_line_sample(density = 1) |>
+      st_cast("POINT") |>
+      st_as_sf() |>
+      st_join(line_temp, join = st_nearest_feature)
+  }))
+  
+  lai_seg_filter <- st_filter(lai_segments, reserve_poly_buf_filter)
+  lai_seg_edges <- filter(lai_seg_filter, startsWith(treatment, "T")) |> 
+    st_buffer(tree_reserve$width[1], endCapStyle = "FLAT")
+  lai_seg_middle <- filter(lai_seg_filter, startsWith(treatment, "R")) |> 
+    st_buffer(tree_reserve$width[1] * 2, endCapStyle = "FLAT")
+  
+  # Join the sample points to the nearest tree polygon to get the treeID's
+  # along the sample points
+  edge_points <- st_join(reserve_hull_sample, tree_reserve, 
+                         join = st_nearest_feature, suffix = c("", ".x")) |>
+    distinct(treeID, .keep_all = TRUE) |> 
+    select(-ends_with(".x"))
+  
+  # Join the tree polygons back to the identified points to get just the tree
+  # polygons of the edge trees
+  edge_trees <- right_join(tree_reserve, st_drop_geometry(edge_points), 
+                           by = "treeID", suffix = c("", ".x")) |> 
+    select(-c(treatment, treatment_adjacent)) |> 
+    rename(treatment = treatment.x) |> 
+    select(-ends_with(".x")) |> 
+    st_join(lai_seg_edges, suffix = c("", ".x"), largest = TRUE) |> 
+    select(-ends_with(".x"))
+  
+  # Assign the remaining trees as "reserve" trees (i.e.: aspect = NA)
+  reserve_trees <- tree_reserve |> 
+    filter(!treeID %in% edge_trees$treeID) |> 
+    mutate(aspect = NA) |> 
+    st_join(lai_seg_middle, suffix = c("", ".x"), largest = TRUE) |> 
+    select(-ends_with(".x")) 
+  
+  # Bind the edge and reserve trees back together, and move columns around
+  tree_reserve <- rbind(edge_trees, reserve_trees) |> 
+    relocate(block, treatment, aspect, .after = reserve_id)
+}, future.seed = NULL))
+
+# Assign remaining trees to be either trees in the middle of the strips, 
+# trees in the control blocks, or extra trees assigned to the block:
+tree_strips <- goudie_trees |> 
+  filter(!treeID %in% tree_assign$treeID) |> 
+  st_join(strip_poly, largest = TRUE, suffix = c("", ".x")) |> 
+  select(-ends_with(".x")) |> 
+  mutate(reserve_id = NA, aspect = NA, segment_id = NA) |> 
+  filter(!is.na(treatment))
+
+tree_control <- goudie_trees |> 
+  filter(!treeID %in% c(tree_assign$treeID, tree_strips$treeID)) |> 
+  st_join(control_poly, largest = TRUE, suffix = c("", ".x")) |> 
+  select(-ends_with(".x")) |> 
+  mutate(reserve_id = NA, aspect = NA, segment_id = NA) |> 
+  filter(!is.na(treatment))
+
+tree_bound <- goudie_trees |> 
+  filter(!treeID %in% c(
+    tree_assign$treeID, tree_strips$treeID, tree_control$treeID)) |> 
+  st_join(bound_poly, largest = TRUE, suffix = c("", ".x")) |> 
+  select(-ends_with(".x")) |> 
+  mutate(reserve_id = NA, aspect = NA, segment_id = NA) |> 
+  filter(!is.na(treatment))
+
+tree_bind <- rbind(tree_assign, tree_strips, tree_control, tree_bound)
+
+st_write(tree_bind, "00_Shapes/trees_attributed.gpkg", append = FALSE, 
+         quiet = TRUE)
+
+```
+
+6.  Do the LAI stuff: Write individual LAS files named by the segment ID. Any of the LAS files that gets produced should have a point cloud with trees in it, which would be used in the LAI stuff that Gill is working on. This is completed in parallel by loading in a LAS file from the LAS catalog, seeing if the segment is fully within that LAS file, filtering that point cloud to just have points belonging to a given segment ID, and then writing that point cloud to a new LAS file. If there are multiple files that a segment spans, then those files are all read in before filtering to the segment ID and writing it to a file.
+
+```{r}
+
+tree_assign <- st_read("00_Shapes/trees_attributed.gpkg", quiet = TRUE)
+
+library(lidR)
+
+# Get normalized LAS files
+las_dirs <- dir("04_tree_seg", full.names = TRUE, pattern = date_filter)
+ctg <- readLAScatalog(las_dirs, chunk_buffer = 5)
+ctg_sf <- st_as_sf(ctg) |> select(filename) |> st_set_agr("constant")
+
+# Create output directory
+lai_dir <- file.path("06_LAI_LAS")
+dir.create(lai_dir, showWarnings = FALSE)
+
+# Assign LAS file paths to each tree
+tree_las_link <- tree_assign |> 
+  select(treeID, segment_id) |> 
+  filter(!is.na(segment_id)) |> 
+  st_set_agr("constant") |> 
+  st_intersection(ctg_sf)
+
+# Create a table of file paths and which segments each file contains
+segment_las_link <- tree_las_link |> 
+  st_drop_geometry() |> 
+  group_by(filename) |> 
+  summarise(segments = list(unique(segment_id)), .groups = "drop")
+
+# Iterate through tiles, save individual LAS files according to the segment ID
+# that the trees belong to
+plan(multisession, workers = availableCores() / 2)
+las_lai <- future_lapply(seq_len(nrow(segment_las_link)), function(x) {
+  
+  # All segments in that LAS file, then read that LAS file
+  las_segments <- segment_las_link[x, ] |> unnest(segments)
+  las <- readLAS(segment_las_link[x, ] |> pull(filename))
+  
+  # Some segments will be within multiple LAS files, find those LAS files if 
+  # needed.
+  segment_write <- lapply(las_segments$segments, function(y) {
+    
+    # Tree ID's and LAS files associated with a particular segment
+    las_link <- tree_las_link |> filter(segment_id == y)
+    
+    # LAS files associated with a particular segment
+    las_files <- las_link |> pull(filename) |> unique()
+    
+    # If there are multiple LAS files, then replace "las" object with all of
+    # the required LAS files for that segment. This could be sped up here by 
+    # adding a "select" argument in here, but I'm not sure which columns are 
+    # required for LAI analysis.
+    if(length(las_files) > 1) las <- readLAS(las_files)
+    
+    # Tree ID's associated with a particular segment
+    tree_ids <- las_link |> pull(treeID)
+    
+    # Filter las object to only include trees from that segment, write LAS file.
+    las <- filter_poi(las, treeID %in% tree_ids)
+    writeLAS(las, file.path(lai_dir, paste0(y, ".las")))
+  })
+}, future.seed = NULL)
+
+plan(sequential)
+gc()
+
+```

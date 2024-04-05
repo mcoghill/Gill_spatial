@@ -1,6 +1,9 @@
+# Make sure you have all of these packages and their dependencies installed
+# before starting!
+
 # CRAN packages
-ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future", "terra", 
-  "data.table", "RCSF", "BiocManager", "devtools")
+ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future.apply", "terra", 
+  "data.table", "units", "rmapshaper", "lwgeom", "RCSF", "lme4", "devtools")
 
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) install.packages(new_packages)
@@ -17,4 +20,5 @@ if(packageVersion("lidR") < "4.0.2") {
 }
 
 # Install my custom lidR function
-devtools::install_github("mcoghill/lidR.li2012enhancement")
+# devtools::install_github("mcoghill/lidR.li2012enhancement")
+

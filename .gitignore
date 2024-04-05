@@ -43,6 +43,7 @@ vignettes/*.pdf
 *.lax
 /00_QGIS/*
 /00_Shapes/trees*
+/00_Shapes/line_segments.gpkg
 /01_las/*
 /02_tile/*
 /03_clean_norm/*
